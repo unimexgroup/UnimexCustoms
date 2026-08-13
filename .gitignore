@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec.bak
+logs/
+output/
+input/*
+!input/.gitkeep
+database/*
+!database/.gitkeep
+~$*
+*.log
+.idea/
+.venv/

@@ -1,0 +1,6 @@
+pandas>=2.0
+openpyxl>=3.1
+xlrd>=2.0
+pdfplumber>=0.11
+pypdf>=4.0
+pyinstaller>=6.0
