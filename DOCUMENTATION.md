@@ -161,6 +161,8 @@ The updater never raises. Offline, DNS failure, GitHub 5xx, rate-limiting, a cha
 
 **Install location matters:** the exe must live somewhere user-writable. In Program Files it cannot replace itself.
 
+**The repo must stay public.** A distributed exe carries no credentials, so the release check is an anonymous API call. Making this repo private returns 404 to every installed copy, and self-update silently stops working — the team would be back to hand-copying builds. Nothing sensitive is tracked here: the parts database, invoices, packing lists and reception reports are all gitignored, and `input\`, `output\`, `database\` and `logs\` hold only a `.gitkeep`.
+
 ---
 
 ## 9. Troubleshooting
