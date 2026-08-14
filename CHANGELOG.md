@@ -3,6 +3,45 @@
 All notable changes to UnimexCustoms. Versions are tagged `customs-vX.Y.Z`;
 the number must match `CUSTOMS_VERSION` in `_version.py` or CI refuses to build.
 
+## v1.1.0 — 2026-08-14
+
+### Added
+
+- **Packing lists in PDF form.** Previously a PDF packing list was reported as
+  unrecognized and the run continued without weights or cartons. PDFs carry no
+  column structure, only ink at coordinates, and every supplier's template
+  differs — so the table is rebuilt geometrically: find the header band, take
+  each header cell's horizontal span as a column, and assign every word below it
+  to the column it sits under. Header cells stacked over several lines
+  (`N.W/CTN` over `(KGS)`) are one column, and a line item's description is
+  gathered from the printed lines above and below its figures, since suppliers
+  wrap it either way.
+- **A validation gate on PDF packing lists.** A parse is only used if it
+  reproduces every total the document states, taken from both the TOTAL row and
+  any prose restatement (`TOTAL SAYS 262CTNS ,G.W 2648.7KGS`). One that does not
+  tie out is refused outright and the run continues without a packing list —
+  blank weights and a loud warning — because wrong weights in a filing are worse
+  than absent ones. When a document states no totals at all, the parse is used
+  but reported as uncorroborated.
+- **Per-part carton counts** when the packing list actually states them per row,
+  replacing the total-on-first-row rule for those documents. Used only when
+  every matched row has a count and they add to the shipment total, so a
+  partly-filled column can never look exact. Documents that state only a
+  shipment total are unchanged.
+- **Combined invoice + packing list (CIPL) PDFs**: when no separate packing list
+  arrives, the invoice PDF is re-read for a packing table. Same validation gate,
+  so a false positive cannot pass.
+- Per-carton columns (`Pcs/ctn`, `N.W/CTN`, `Vol./ctn`) are recognized and
+  excluded, so a per-unit figure is never mistaken for a row total.
+
+### Fixed
+
+- The packing-list totals check treated a missing total as a pass. When a column
+  was mis-identified, that column's total cell is empty — so the check was
+  skipped on exactly the parses that had gone wrong. It now validates against
+  every stated total from every source, and a mismatch anywhere refuses the
+  parse.
+
 ## v1.0.0 — 2026-08-13
 
 First release. Replaces the hand-run `customs-summary-prompt.txt` workflow with

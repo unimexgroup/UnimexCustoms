@@ -3,7 +3,7 @@
 A standalone Windows tool that turns one inbound shipment's paperwork into the customs team's Excel file: **one row per part number**, aggregated across every invoice in the shipment, with the **US HTS code** pulled from the Kohler parts database.
 
 **Department:** US Customs Brokerage
-**Current version:** v1.0.0
+**Current version:** v1.1.0
 
 Replaces the hand-run `customs-summary-prompt.txt` workflow. Same output, same checks, no prompting.
 
@@ -22,7 +22,7 @@ Publishing a new version is automated: push a `customs-vX.Y.Z` tag and GitHub Ac
 3. Put the latest **`Kohler Parts for Upload ....xlsx`** in `database\`. The tool always uses the most recently modified file there, so refreshing the database is just dropping in the new file.
 4. Drop one shipment's documents into `input\`:
    - commercial invoices (PDF) — **required**
-   - packing list (`.xls`/`.xlsx`) — supplies weights and cartons
+   - packing list (`.xls`, `.xlsx` or PDF) — supplies weights and cartons
    - warehouse reception report (PDF) — optional cross-check
 5. Double-click again. `output\customs_summary_<shipment>.xlsx` appears.
 
@@ -39,7 +39,7 @@ Sorted by value descending, with a bold TOTAL row using live `=SUM()` formulas. 
 
 Two things worth knowing before filing:
 
-- **Cartons.** Shipping paperwork states a shipment total only, never a per-part count. The whole total sits on the **first row** so the column still ties out to the shipment; it is not an allocation and the other rows are blank by design.
+- **Cartons.** Most shipping paperwork states a shipment total only, never a per-part count. In that case the whole total sits on the **first row** so the column still ties out; it is not an allocation and the other rows are blank by design. When a packing list *does* state a count per line, those real per-part counts are used instead. The run log says which rule applied.
 - **Per-row weights are allocated**, not measured. The packing list states weight once per HS group, so each group is split across its parts in proportion to piece count. Column totals are exact; a group holding a single part is exact; everything else assumes equal weight per piece. The run log names which groups came out which way.
 
 ## Reconciliation

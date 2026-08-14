@@ -77,8 +77,10 @@ PL_COLUMN_TOKENS = {
     "description": ["description", "descripcion"],
     "qty":         ["qty", "quantity", "pcs", "cantidad"],
     "hs":          ["hsncode", "hscode", "hsn", "hs", "tariff", "fraccion"],
-    "gross":       ["grossweight", "gross", "pesobruto"],
-    "net":         ["netweight", "net", "pesoneto"],
+    # 'g.w'/'n.w' cover the PDF templates that abbreviate; the per-carton
+    # variants ('G.W/CTN') are filtered out before these are applied.
+    "gross":       ["grossweight", "gross", "g.w", "gw(", "pesobruto"],
+    "net":         ["netweight", "net", "n.w", "nw(", "pesoneto"],
     "volume":      ["volume", "cbm", "volumen"],
     "cartons":     ["carton", "ctn", "cajas", "bultos", "package"],
 }
@@ -442,6 +444,7 @@ class PackingRow:
     qty: float
     hs: str
     group: int
+    cartons: float | None = None   # only some templates state cartons per row
     consumed: bool = False
 
 
@@ -565,7 +568,7 @@ def parse_packing_list(path: Path) -> PackingList:
 
         pl.rows.append(PackingRow(
             po=po, part=part, qty=qty,
-            hs=str(cell(r, "hs") or "").strip(), group=group,
+            hs=str(cell(r, "hs") or "").strip(), group=group, cartons=ctn,
         ))
 
     if pl.cartons is None and carton_values:
@@ -586,6 +589,310 @@ def parse_packing_list(path: Path) -> PackingList:
         if len(codes) > 1:
             pl.notes.append(f"weight group {g + 1} spans more than one HS code: "
                             f"{', '.join(sorted(codes))}")
+    return pl
+
+
+# ---------------------------------------------------------------------------
+# Packing list, PDF form
+#
+# PDF packing lists carry no column structure -- only ink at coordinates -- and
+# every supplier's template differs. Rather than a regex per supplier, the table
+# is rebuilt geometrically: find the header, take each header cell's horizontal
+# span as a column, then assign every word below it to the column it sits under.
+#
+# The parse is only trusted if it reproduces the document's own printed totals
+# (section "validate"). A packing list that does not tie out is REFUSED, and the
+# caller falls back to running without one -- blank weights and a loud warning --
+# because wrong weights in a filing are far worse than absent ones.
+# ---------------------------------------------------------------------------
+# Header cells naming a PER-CARTON figure ("N.W/CTN", "Pcs/ctn", "Vol./ctn").
+# These must never be mistaken for the row's total weight or quantity.
+PL_PER_UNIT_MARKERS = ("/ctn", "/ ctn", "perctn", "/carton", "/box", "percarton")
+
+# Horizontal gap, in points, below which two header words are taken to be part
+# of the same header cell rather than two columns. A word space is ~2-3pt here;
+# the narrowest real gutter observed is 8pt.
+HEADER_WORD_GAP = 6.0
+
+
+def _lead_num(text: object) -> float | None:
+    """Leading number of a cell: '3,240 pcs' -> 3240.0, '216CTNS' -> 216.0."""
+    if text is None:
+        return None
+    m = re.match(r"\s*([\d,]+(?:\.\d+)?)", str(text))
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _cluster_lines(words: list[dict], ytol: float = 2.5) -> list[list[dict]]:
+    """Group words into visual lines by their vertical position."""
+    lines: dict[int, list[dict]] = {}
+    for w in words:
+        lines.setdefault(int(round(w["top"] / ytol)), []).append(w)
+    return [sorted(ws, key=lambda w: w["x0"]) for _, ws in sorted(lines.items())]
+
+
+def _header_columns(band: list[list[dict]]) -> list[dict]:
+    """
+    Turn the header band's words into columns.
+
+    A header cell can be stacked over several physical lines --
+    'N.W/CT' / 'N' / '(KGS)' are one column -- so words are clustered by
+    HORIZONTAL OVERLAP across the whole band, not by line.
+    """
+    flat = [w for line in band for w in line]
+    if not flat:
+        return []
+    cols: list[dict] = []
+    for w in sorted(flat, key=lambda w: w["x0"]):
+        hit = next((c for c in cols if w["x0"] <= c["x1"] + 1 and w["x1"] >= c["x0"] - 1), None)
+        if hit:
+            hit["x0"] = min(hit["x0"], w["x0"])
+            hit["x1"] = max(hit["x1"], w["x1"])
+            hit["words"].append(w)
+        else:
+            cols.append({"x0": w["x0"], "x1": w["x1"], "words": [w]})
+
+    # A header cell's own words are separated by a normal word space
+    # ('Kohler PO#', 'DESCRIPTION OF GOODS'); the gutter between two columns is
+    # several times wider. Merge across the small gaps so one cell stays one
+    # column, or the values underneath land in a column with no name.
+    merged: list[dict] = []
+    for c in sorted(cols, key=lambda c: c["x0"]):
+        if merged and c["x0"] - merged[-1]["x1"] <= HEADER_WORD_GAP:
+            merged[-1]["x1"] = max(merged[-1]["x1"], c["x1"])
+            merged[-1]["words"].extend(c["words"])
+        else:
+            merged.append(c)
+    cols = merged
+    for c in cols:
+        c["words"].sort(key=lambda w: (w["top"], w["x0"]))
+        c["text"] = " ".join(w["text"] for w in c["words"])
+        c["norm"] = "".join(c["text"].lower().split())
+    return sorted(cols, key=lambda c: c["x0"])
+
+
+def _assign_columns(cols: list[dict], line: list[dict]) -> dict[int, str]:
+    """Bucket a data line's words into columns by where they sit horizontally.
+    Values are often wider than their header, so a word that overhangs every
+    column falls to the nearest one by centre distance."""
+    out: dict[int, list[str]] = {}
+    for w in line:
+        mid = (w["x0"] + w["x1"]) / 2
+        idx = next((i for i, c in enumerate(cols) if c["x0"] - 1 <= mid <= c["x1"] + 1), None)
+        if idx is None:
+            idx = min(range(len(cols)),
+                      key=lambda i: abs(mid - (cols[i]["x0"] + cols[i]["x1"]) / 2))
+        out.setdefault(idx, []).append(w["text"])
+    return {i: " ".join(v) for i, v in out.items()}
+
+
+def _map_pdf_columns(cols: list[dict]) -> dict[str, int]:
+    """Map canonical names onto header columns, per-carton columns excluded."""
+    found: dict[str, int] = {}
+    eligible = [i for i, c in enumerate(cols)
+                if not any(m in c["norm"] for m in PL_PER_UNIT_MARKERS)]
+    for canon, tokens in PL_COLUMN_TOKENS.items():
+        for tok in tokens:
+            for i in eligible:
+                if i in found.values():
+                    continue
+                if tok in cols[i]["norm"]:
+                    found[canon] = i
+                    break
+            if canon in found:
+                break
+    return found
+
+
+def _part_from_text(text: str) -> str:
+    """Templates without a part column print it as the first token of the
+    description: '1195792-CP TRIP LEVER ASSEMBLY' -> '1195792-CP'."""
+    for tok in str(text).split():
+        cleaned = tok.strip(",;:()")
+        if len(cleaned) >= 4 and any(ch.isdigit() for ch in cleaned) \
+                and re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z\-./]*", cleaned):
+            return _norm_key(cleaned)
+    return ""
+
+
+def parse_packing_list_pdf(path: Path) -> PackingList:
+    """Read a packing list that arrived as a PDF. Raises if it cannot be
+    parsed and validated -- never returns a half-read table."""
+    import pdfplumber
+
+    pl = PackingList(path=path)
+    header_cols: list[dict] = []
+    cols_map: dict[str, int] = {}
+    totals_line: dict[int, str] = {}
+    group = -1
+
+    with pdfplumber.open(str(path)) as pdf:
+        for page in pdf.pages:
+            lines = _cluster_lines(page.extract_words())
+            if not lines:
+                continue
+
+            # Locate the header on this page: the run of up to 5 consecutive
+            # lines that together name the most canonical columns. Continuation
+            # pages often repeat it; if this page has none, keep the last one.
+            best: tuple[int, list[dict], dict[str, int]] | None = None
+            for start in range(min(len(lines), 60)):
+                for span in range(1, 6):
+                    if start + span > len(lines):
+                        break
+                    cols = _header_columns(lines[start:start + span])
+                    mapped = _map_pdf_columns(cols)
+                    score = len(mapped) + (2 if {"qty", "gross"} <= set(mapped) else 0)
+                    if {"qty"} <= set(mapped) and (best is None or score > best[0]):
+                        best = (score, cols, mapped)
+            if best and best[0] >= 4:
+                header_cols, cols_map = best[1], best[2]
+                header_bottom = max(w["bottom"] for c in header_cols for w in c["words"])
+            elif header_cols:
+                header_bottom = 0.0
+            else:
+                continue
+
+            def val(cells: dict[int, str], name: str) -> str:
+                idx = cols_map.get(name)
+                return cells.get(idx, "") if idx is not None else ""
+
+            # Pass 1: split the body into rows that carry numbers and lines that
+            # carry only text. A line item's description often spans several
+            # printed lines, above AND below its figures.
+            data: list[tuple[float, dict[int, str]]] = []
+            loose: list[tuple[float, str]] = []
+            for line in lines:
+                if line[0]["top"] <= header_bottom:
+                    continue
+                cells = _assign_columns(header_cols, line)
+                text = " ".join(w["text"] for w in line)
+                if re.match(r"\s*total", text, re.I):
+                    for k, v in cells.items():
+                        totals_line.setdefault(k, v)
+                    continue
+                if _lead_num(val(cells, "qty")) is None:
+                    desc = val(cells, "description") or text
+                    loose.append((line[0]["top"], desc))
+                else:
+                    data.append((line[0]["top"], cells))
+
+            # Pass 2: every text-only line belongs to the row it sits closest
+            # to vertically -- which is how a person reads it off the page.
+            extra: dict[int, list[str]] = {}
+            for top, desc in loose:
+                if not data:
+                    break
+                i = min(range(len(data)), key=lambda k: abs(data[k][0] - top))
+                extra.setdefault(i, []).append(desc)
+
+            for i, (_, cells) in enumerate(data):
+                qty = _lead_num(val(cells, "qty"))
+                gross = _lead_num(val(cells, "gross"))
+                net = _lead_num(val(cells, "net"))
+
+                description = " ".join([val(cells, "description")] + extra.get(i, [])).strip()
+                part = _norm_key(val(cells, "part")) or _part_from_text(description)
+                if not part:
+                    continue
+                if gross is not None:
+                    group += 1
+                    pl.group_gross[group] = gross
+                    pl.group_net[group] = net if net is not None else 0.0
+                elif group < 0:
+                    group = 0
+                    pl.group_gross.setdefault(group, 0.0)
+                    pl.group_net.setdefault(group, 0.0)
+
+                pl.rows.append(PackingRow(
+                    po=_norm_key(val(cells, "po")),
+                    part=part,
+                    qty=qty,
+                    hs=re.sub(r"\D", "", val(cells, "hs")),
+                    group=group,
+                    cartons=_lead_num(val(cells, "cartons")),
+                ))
+
+    if not pl.rows:
+        raise RuntimeError(f"{path.name}: looks like a packing list but no line "
+                           f"items could be read from it")
+    if not cols_map:
+        raise RuntimeError(f"{path.name}: no packing-list header row found")
+
+    def total_of(name: str) -> float | None:
+        idx = cols_map.get(name)
+        return _lead_num(totals_line.get(idx)) if idx is not None else None
+
+    # ---- validate: the parse must reproduce the document's own totals -------
+    #
+    # Gather every total the document states, from BOTH its TOTAL row and any
+    # prose restatement ("TOTAL SAYS 262CTNS ,G.W 2648.7KGS"). Both are needed:
+    # if a column was mis-identified, that column's total row cell is empty, so
+    # checking only the column total would skip the check on exactly the parse
+    # that got it wrong -- a missing value passing as a match.
+    stated: dict[str, list[float]] = {"qty": [], "gross": [], "net": [], "cartons": []}
+    for name in stated:
+        v = total_of(name)
+        if v is not None:
+            stated[name].append(v)
+
+    prose = {
+        "gross":   r"(?:G\.?\s*W\.?|GROSS\s*WEIGHT)[^0-9]{0,12}([\d,]+\.?\d*)",
+        "net":     r"(?:N\.?\s*W\.?|NET\s*WEIGHT)[^0-9]{0,12}([\d,]+\.?\d*)",
+        "cartons": r"([\d,]+)\s*(?:CTNS?|CARTONS?)\b",
+    }
+    for page_text in extract_pdf_pages(path):
+        for ln in page_text.splitlines():
+            if not re.search(r"total", ln, re.I):
+                continue
+            for name, pattern in prose.items():
+                for m in re.finditer(pattern, ln, re.I):
+                    val_ = _lead_num(m.group(1))
+                    if val_ is not None:
+                        stated[name].append(val_)
+
+    def check(label: str, ours: float, values: list[float], tol: float) -> None:
+        for v in values:
+            if abs(ours - v) > tol:
+                raise RuntimeError(
+                    f"{path.name}: parsed {label} {ours:,.2f} does not match the "
+                    f"{v:,.2f} stated on the document -- refusing this packing list "
+                    f"rather than filing figures that may be wrong")
+
+    row_cartons = [r.cartons for r in pl.rows if r.cartons is not None]
+    check("quantity", sum(r.qty for r in pl.rows), stated["qty"], 0.5)
+    check("gross weight", sum(pl.group_gross.values()), stated["gross"], 0.05)
+    check("net weight", sum(pl.group_net.values()), stated["net"], 0.05)
+    if len(row_cartons) == len(pl.rows) and row_cartons:
+        check("carton count", sum(row_cartons), stated["cartons"], 0.5)
+
+    pl.total_qty = stated["qty"][0] if stated["qty"] else None
+    pl.total_gross = stated["gross"][0] if stated["gross"] else None
+    pl.total_net = stated["net"][0] if stated["net"] else None
+
+    if len(row_cartons) == len(pl.rows) and row_cartons:
+        pl.cartons = sum(row_cartons)
+        pl.carton_source = "per-row carton counts"
+    elif stated["cartons"]:
+        pl.cartons = stated["cartons"][0]
+        pl.carton_source = "the packing list's stated total"
+
+    # Say so when there was nothing to check against, rather than letting an
+    # uncorroborated parse look as solid as a verified one.
+    for name, label in (("gross", "gross weight"), ("net", "net weight")):
+        if not stated[name]:
+            pl.notes.append(f"the packing list states no total {label}, so the figures "
+                            f"read from it could not be corroborated against the document")
+
+    m = re.search(r"(?:shipment|s/?o|booking)\s*(?:no\.?|number|#)?\s*[:.]?\s*(\S+)",
+                  "\n".join(extract_pdf_pages(path)[:1]), re.I)
+    if m and re.search(r"\d", m.group(1)):
+        pl.shipment_no = m.group(1).strip(":#.,")
     return pl
 
 
@@ -870,10 +1177,10 @@ class ShipmentResult:
 
 
 def join_invoice_to_packing(lines: list[InvoiceLine], pl: PackingList,
-                            res: ShipmentResult) -> dict[int, int]:
+                            res: ShipmentResult) -> dict[int, PackingRow]:
     """
     Match every invoice line to its packing-list row on (PO, part, qty) and
-    return {index into lines -> weight group}.
+    return {index into lines -> the packing row it matched}.
 
     Never joins by row position: documents do not share a row order (TRAP 2).
     Hand-keyed part numbers carry typos (TRAP 3), so an unmatched part is
@@ -884,7 +1191,7 @@ def join_invoice_to_packing(lines: list[InvoiceLine], pl: PackingList,
     for row in pl.rows:
         by_triple.setdefault((row.po, row.part, row.qty), []).append(row)
 
-    group_of: dict[int, int] = {}
+    matched: dict[int, PackingRow] = {}
     for i, ln in enumerate(lines):
         cand = by_triple.get((ln.po, ln.part, ln.qty), [])
         row = next((r for r in cand if not r.consumed), None)
@@ -920,18 +1227,18 @@ def join_invoice_to_packing(lines: list[InvoiceLine], pl: PackingList,
             continue
 
         row.consumed = True
-        group_of[i] = row.group
+        matched[i] = row
 
     for row in pl.rows:
         if not row.consumed:
             res.problems.append(
                 f"packing-list row PO {row.po} part {row.part} qty {row.qty:,.0f}: "
                 f"no invoice line")
-    return group_of
+    return matched
 
 
 def build_rows(lines: list[InvoiceLine], pl: PackingList | None,
-               group_of: dict[int, int], db: PartsDB,
+               matched: dict[int, PackingRow], db: PartsDB,
                res: ShipmentResult) -> list[dict]:
     """Aggregate to one row per part, allocating weight inside each HS group."""
     # Per (group, part): qty and value.
@@ -947,10 +1254,10 @@ def build_rows(lines: list[InvoiceLine], pl: PackingList | None,
         if ln.invoice_hs:
             p["inv_hs"].add(ln.invoice_hs)
 
-        g = group_of.get(i)
-        if g is None:
+        prow = matched.get(i)
+        if prow is None:
             continue
-        gp = per_group.setdefault(g, {}).setdefault(ln.part, {"qty": 0.0})
+        gp = per_group.setdefault(prow.group, {}).setdefault(ln.part, {"qty": 0.0})
         gp["qty"] += ln.qty
 
     gross_by_part: dict[str, float] = {}
@@ -1005,15 +1312,43 @@ def build_rows(lines: list[InvoiceLine], pl: PackingList | None,
 
     rows.sort(key=lambda r: r["Value"], reverse=True)
 
-    # Cartons: shipping paperwork gives a shipment TOTAL only, never a per-part
-    # count. Rather than invent an allocation, the whole total sits on the first
-    # row so the column still ties out to the shipment.
-    if pl is not None and pl.cartons is not None and rows:
-        rows[0]["Cartons"] = int(pl.cartons) if float(pl.cartons).is_integer() else pl.cartons
-        res.notes.append(
-            f"cartons: shipment total {pl.cartons:,.0f} placed on the first row "
-            f"({rows[0]['Part #']}); source was the {pl.carton_source}. The paperwork "
-            f"does not state cartons per part.")
+    # Cartons. Most paperwork gives a shipment TOTAL only, in which case the
+    # whole total sits on the first row: the column still ties out and nothing
+    # is invented. Some templates do state a count per line, and those are used
+    # as-is -- but only when EVERY matched row has one and they add up to the
+    # shipment total, so a partly-filled column can never masquerade as exact.
+    if pl is not None and rows:
+        per_part: dict[str, float] = {}
+        usable = bool(matched) and all(r.cartons is not None for r in matched.values())
+        if usable:
+            counted: set[int] = set()          # a packing row's cartons count once
+            for i, ln in enumerate(lines):
+                prow = matched.get(i)
+                if prow is None or id(prow) in counted:
+                    continue
+                counted.add(id(prow))
+                per_part[ln.part] = per_part.get(ln.part, 0.0) + prow.cartons
+            total = sum(per_part.values())
+            if pl.cartons is not None and abs(total - pl.cartons) > 0.5:
+                res.warnings.append(
+                    f"per-row carton counts add to {total:,.0f} but the shipment total "
+                    f"is {pl.cartons:,.0f}; falling back to the total on the first row")
+                usable = False
+        if usable and per_part:
+            for r in rows:
+                c = per_part.get(r["Part #"])
+                if c is not None:
+                    r["Cartons"] = int(c) if float(c).is_integer() else c
+            res.notes.append(
+                f"cartons: per-part counts taken from the {pl.carton_source}, "
+                f"totalling {sum(per_part.values()):,.0f}.")
+        elif pl.cartons is not None:
+            rows[0]["Cartons"] = (int(pl.cartons) if float(pl.cartons).is_integer()
+                                  else pl.cartons)
+            res.notes.append(
+                f"cartons: shipment total {pl.cartons:,.0f} placed on the first row "
+                f"({rows[0]['Part #']}); source was the {pl.carton_source}. The "
+                f"paperwork does not state cartons per part.")
     return rows
 
 
@@ -1246,10 +1581,16 @@ def classify(path: Path) -> str:
         head = "\n".join(pages[:3])
         if re.search(r"REPORTE\s+DE\s+RECEPCION|RECONOCIMIENTO\s+PREVIO", head, re.I):
             return "reception"
+        # A combined invoice+packing document (CIPL) is filed as invoices: the
+        # invoice side is the one this tool cannot do without. process_shipment
+        # then re-reads the same file for a packing table if none arrived
+        # separately.
         if re.search(r"\bInvoice\b", head, re.I) and re.search(r"P\.?\s*O\.?\s*No", head, re.I):
             return "invoices"
         if re.search(r"Invoice\s+Summary", head, re.I):
             return "invoices"
+        if re.search(r"PACKING\s*LIST", head, re.I):
+            return "packing"
         return "unknown"
     if suffix in {".xls", ".xlsx", ".xlsm"}:
         try:
@@ -1268,6 +1609,20 @@ def classify(path: Path) -> str:
     return "unknown"
 
 
+def read_packing_list(path: Path, res: ShipmentResult) -> PackingList | None:
+    """Read a packing list in whichever form it arrived. A PDF that cannot be
+    parsed and validated is reported and dropped, not half-used: the run then
+    continues without weights rather than with weights nobody can trust."""
+    try:
+        if path.suffix.lower() == ".pdf":
+            return parse_packing_list_pdf(path)
+        return parse_packing_list(path)
+    except Exception as e:
+        res.problems.append(f"packing list {path.name} could not be used: {e}")
+        print(f"  [WARN] {e}")
+        return None
+
+
 def process_shipment(docs: dict[str, list[Path]], db: PartsDB,
                      out_dir: Path, label: str) -> tuple[int, str]:
     """Run one shipment end to end. Returns (problem count, message)."""
@@ -1282,7 +1637,18 @@ def process_shipment(docs: dict[str, list[Path]], db: PartsDB,
 
     pl = None
     if docs["packing"]:
-        pl = parse_packing_list(docs["packing"][0])
+        pl = read_packing_list(docs["packing"][0], res)
+    if pl is None:
+        # No usable packing list of its own. A combined invoice+packing PDF
+        # (CIPL) carries the table inside the invoice file, so try there before
+        # giving up on weights. Strictly validated, so a wrong guess cannot pass.
+        try:
+            pl = parse_packing_list_pdf(docs["invoices"][0])
+            print(f"  [INFO] packing table read from {docs['invoices'][0].name} "
+                  f"(combined invoice + packing list)")
+        except Exception:
+            pl = None
+    if pl is not None:
         print(f"  packing list ... {len(pl.rows)} row(s), {len(pl.group_gross)} weight "
               f"group(s), cartons {pl.cartons if pl.cartons is not None else 'n/a'}")
 
@@ -1292,8 +1658,8 @@ def process_shipment(docs: dict[str, list[Path]], db: PartsDB,
         print(f"  reception ...... {len(rep.rows)} row(s)"
               f"{', guide ' + rep.guide if rep.guide else ''}")
 
-    group_of = join_invoice_to_packing(doc.lines, pl, res) if pl else {}
-    rows = build_rows(doc.lines, pl, group_of, db, res)
+    matched = join_invoice_to_packing(doc.lines, pl, res) if pl else {}
+    rows = build_rows(doc.lines, pl, matched, db, res)
     reconcile(doc, pl, rep, rows, res)
 
     shipment = (pl.shipment_no if pl and pl.shipment_no
@@ -1366,7 +1732,12 @@ def run(in_dir: Path, out_dir: Path, db_dir: Path) -> int:
                 print(f"\nNo documents in {in_dir}. Drop one shipment's invoices, packing "
                       f"list and reception report there, then run again.")
                 return 0
-            print(f"\n[SKIP] {label}: no commercial invoice PDF found")
+            # Say what WAS recognized, so it is obvious whether the other
+            # documents were understood and only the invoices are missing.
+            seen = [f"{len(docs[k])} {k}" for k in ("packing", "reception", "unknown")
+                    if docs[k]]
+            print(f"\n[SKIP] {label}: no commercial invoice PDF found"
+                  + (f" (found {', '.join(seen)})" if seen else ""))
             problems += 1
             continue
 

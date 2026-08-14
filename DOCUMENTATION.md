@@ -21,7 +21,7 @@ Documents are identified by **content**, never by filename (`classify()`), becau
 | Document | Required | Supplies | Recognized by |
 |---|---|---|---|
 | Commercial invoices (PDF) | **Yes** | part, qty, unit price, extended value, PO, country of origin, invoice HS | pages containing "Invoice" and "P.O. No." |
-| Packing list (`.xls`/`.xlsx`) | Strongly wanted | gross/net weight per HS group, cartons, shipment number | a header row with Purchase Order + Material + Qty |
+| Packing list (`.xls`/`.xlsx`/PDF) | Strongly wanted | gross/net weight per HS group, cartons, shipment number | Excel: a header row with Purchase Order + Material + Qty. PDF: the text "PACKING LIST" plus a readable table |
 | Warehouse reception report (PDF) | Optional | independent part/qty check, Mexican fracción | "REPORTE DE RECEPCION" / "RECONOCIMIENTO PREVIO" |
 | Parts database (`.xlsx`) | **Yes** | `Product Key` → `HTS` | lives in `database\`, not `input\` |
 
@@ -70,9 +70,26 @@ Every non-exact match is printed as a `[NOTE]` line so the resolution path is au
 
 A group holding one part is exact. Any other group assumes equal weight per piece — an estimate, and the run log says so and names which groups are which.
 
+### Packing lists in PDF form
+
+A PDF has no columns — only ink at coordinates — and every supplier's template differs, so there is no regex to write. `parse_packing_list_pdf()` rebuilds the table geometrically:
+
+1. Cluster words into visual lines by vertical position.
+2. Find the header: the run of up to 5 consecutive lines that together name the most canonical columns. A header cell stacked over several lines (`N.W/CTN` over `N` over `(KGS)`) is **one** column, so header words are clustered by horizontal overlap across the whole band, then merged across gaps narrower than a column gutter — otherwise `Kohler PO#` becomes two columns and the values beneath land in a column with no name.
+3. Assign each word below the header to the column it sits under, by centre position, falling back to the nearest column since values often overhang their header.
+4. Gather each line item's description from the printed lines above **and** below its figures — suppliers wrap it either way — assigning each text-only line to the row it sits nearest, which is how a person reads it off the page.
+
+Columns naming a per-carton figure (`Pcs/ctn`, `N.W/CTN`, `Vol./ctn`) are excluded before the mapping runs, so a per-unit weight is never mistaken for a row total.
+
+**The validation gate.** A geometric parse can go wrong in ways that still look plausible, so the result is only used if it reproduces every total the document states — from the TOTAL row *and* from any prose restatement (`TOTAL SAYS 262CTNS ,G.W 2648.7KGS`). Anything that does not tie out is **refused**, and the run continues as though no packing list arrived: blank weights, blank cartons, loud warning. Wrong weights in a filing are worse than absent ones.
+
+Both sources are needed, and that is not belt-and-braces. When a column is mis-identified, that column's cell in the TOTAL row is *empty* — so a check that skips missing values would skip the check precisely on the parses that had gone wrong. This bug shipped in v1.0.0's gate and was fixed in v1.1.0; the sabotage test that catches it is described below. When a document states no totals at all, the parse is used but reported as uncorroborated rather than being presented as verified.
+
 ### Cartons
 
-The paperwork gives a shipment total only. The full total is written to the **first output row** (highest value, since rows sort by value descending) and every other row is left blank. The column still ties out to the shipment; it is explicitly not a per-part count and not an allocation.
+Most paperwork gives a shipment total only. The full total is then written to the **first output row** (highest value, since rows sort by value descending) and every other row is left blank. The column still ties out to the shipment; it is explicitly not a per-part count and not an allocation.
+
+Some templates do state a carton count per line. Those real counts are used per part instead — but only when **every** matched row has one **and** they add to the shipment total, so a partly-filled column can never masquerade as exact. The run log states which rule applied.
 
 ---
 
@@ -170,6 +187,8 @@ The updater never raises. Offline, DNS failure, GitHub 5xx, rate-limiting, a cha
 | Symptom | Cause / fix |
 |---|---|
 | `no parts database found` | `database\` is empty. Drop the latest `Kohler Parts for Upload ....xlsx` there. |
+| `refusing this packing list` | The PDF parsed, but the figures did not match the totals printed on it. The run continued without weights. Send the PDF to Andy — the template needs a look. |
+| PDF packing list read but weights look odd | Check the log for "could not be corroborated": that document states no totals, so nothing could be verified against it. |
 | `[SKIP] ...: no commercial invoice PDF found` | The invoice PDF is missing, or it is a scan with no text layer. |
 | Part on the `Review` sheet, blank HTS | Either the part is not in the database, or its base number carries conflicting codes. Resolve in the database, then re-run. |
 | `output gross != packing list` | The join dropped lines. Look for the `no packing-list row` / `no invoice line` `[CHECK]` lines above it. |
