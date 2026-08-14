@@ -3,7 +3,7 @@
 A standalone Windows tool that turns one inbound shipment's paperwork into the customs team's Excel file: **one row per part number**, aggregated across every invoice in the shipment, with the **US HTS code** pulled from the Kohler parts database.
 
 **Department:** US Customs Brokerage
-**Current version:** v1.1.0
+**Current version:** v1.2.0
 
 Replaces the hand-run `customs-summary-prompt.txt` workflow. Same output, same checks, no prompting.
 
@@ -20,13 +20,14 @@ Publishing a new version is automated: push a `customs-vX.Y.Z` tag and GitHub Ac
 1. Copy `UnimexCustoms.exe` to any user-writable folder.
 2. Double-click once — creates `input\`, `output\`, `database\`, `logs\` next to it.
 3. Put the latest **`Kohler Parts for Upload ....xlsx`** in `database\`. The tool always uses the most recently modified file there, so refreshing the database is just dropping in the new file.
-4. Drop one shipment's documents into `input\`:
-   - commercial invoices (PDF) — **required**
-   - packing list (`.xls`, `.xlsx` or PDF) — supplies weights and cartons
+4. Put the shipment's paperwork into `input\` — either the carrier's **.zip exactly as received**, or the loose documents:
+   - commercial invoices (PDF **or** Excel) — **required**
+   - packing list (`.xls`, `.xlsx` or PDF) — supplies weights and cartons; often the same workbook as the invoice
    - warehouse reception report (PDF) — optional cross-check
+   - waybills, FCRs, container checklists — harmless, they're recognized and skipped
 5. Double-click again. `output\customs_summary_<shipment>.xlsx` appears.
 
-Processing several shipments at once: give each one its own subfolder under `input\`.
+Processing several shipments at once: drop in one zip per shipment, or give each one its own subfolder under `input\`. Duplicate copies of the same document (`X.pdf` and `X (1).pdf`) are detected and counted once.
 
 Documents are identified by their **contents**, not their filenames — the team can drop them in exactly as received.
 
@@ -40,7 +41,8 @@ Sorted by value descending, with a bold TOTAL row using live `=SUM()` formulas. 
 Two things worth knowing before filing:
 
 - **Cartons.** Most shipping paperwork states a shipment total only, never a per-part count. In that case the whole total sits on the **first row** so the column still ties out; it is not an allocation and the other rows are blank by design. When a packing list *does* state a count per line, those real per-part counts are used instead. The run log says which rule applied.
-- **Per-row weights are allocated**, not measured. The packing list states weight once per HS group, so each group is split across its parts in proportion to piece count. Column totals are exact; a group holding a single part is exact; everything else assumes equal weight per piece. The run log names which groups came out which way.
+- **Per-row weights are allocated**, not measured, *when* the packing list states weight once per HS group: each group is split across its parts in proportion to piece count. Column totals are exact; a group holding a single part is exact; everything else assumes equal weight per piece. The run log names which groups came out which way. Packing lists that state a weight per line give exact figures throughout.
+- **Net weight can be blank.** Some suppliers state gross only. Nothing is invented in its place; the run log says so plainly.
 
 ## Reconciliation
 

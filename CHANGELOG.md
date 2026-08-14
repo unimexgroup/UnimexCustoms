@@ -3,6 +3,71 @@
 All notable changes to UnimexCustoms. Versions are tagged `customs-vX.Y.Z`;
 the number must match `CUSTOMS_VERSION` in `_version.py` or CI refuses to build.
 
+## v1.2.0 — 2026-08-14
+
+Adds the supplier formats in the August batch: three families that send the
+commercial invoice as a **spreadsheet**, which the tool previously could not
+read at all. Verified against all eight shipments in that batch; every one now
+ties to the totals printed on its own documents.
+
+### Added
+
+- **Invoices in Excel.** Found by header keywords like the packing list, so a
+  new supplier's column order costs nothing. Handles headers stacked over two
+  or three rows, several invoice sheets in one workbook (`CI 1` + `CI 2` is one
+  shipment), and country of origin stated once in the header rather than per
+  line.
+- **Invoices as a PDF table.** Suppliers who print one table instead of
+  one-invoice-per-page are read with the same geometric parser as the PDF
+  packing list. Currency marks are stripped (`US$12,150.00`).
+- **Several invoice documents per shipment** are merged. One supplier sends one
+  file per invoice, and the customs file covers the whole shipment.
+- **Several packing sheets per workbook** are merged, with their totals summed.
+  A shipment split across `PK40GP1` and `PK40GP2` previously lost half its
+  weights silently.
+- **Zip input.** Drop the carrier's zip in `input\` and it is extracted and
+  processed as one shipment; already-extracted folders keep working unchanged.
+  Archive paths are flattened and sanitized so no member can escape the folder.
+- **Duplicate detection.** Byte-identical copies (`X.pdf` and `X (1).pdf`, which
+  is how these arrive by email) are counted once instead of doubling every
+  figure.
+- **Transport paperwork is recognized and skipped** — waybills, bills of lading,
+  FCRs, arrival notices, container checklists, images. It used to be reported as
+  unrecognized, which counted as a problem and triggered pointless update checks.
+- **Blank net weight** where a supplier states gross only, with a plain warning.
+  Nothing is copied from gross to fill the column.
+- **Value and weight true-up.** Rounding each part to the cent could leave a
+  column a cent or two off the figure printed on the invoice or packing list;
+  the residual is now pushed onto the largest rows so the file ties exactly.
+  Bounded, so a genuine discrepancy is still reported rather than smeared away.
+
+### Changed
+
+- **Invoice and packing list are now reconciled per (PO, part), not per line.**
+  The two documents agree on what shipped, not on how it was written down: one
+  supplier splits a part across four invoice lines and two packing rows, another
+  prints one packing row per pallet. Weights and cartons are read from the
+  packing rows directly, which is the document that states what physically
+  shipped. This removed the per-line join and the pallet-merging pass it needed.
+- Packing lists that never repeat the purchase order are matched on part number
+  alone, and say so.
+
+### Fixed
+
+- A column was mapped to the **leftmost** header containing its keyword. One
+  supplier leaves a stray `PO#` label above an unrelated column, so the PO was
+  read from an empty column and every join failed. The closest-matching header
+  now wins.
+- An invoice sheet with PO, part and quantity was read as a **packing list with
+  no weights**, which silently suppressed the "no packing list" warning. A
+  packing sheet must now also carry weights or cartons.
+- An invoice sheet carrying a cartons column was read as a **second packing
+  sheet**, double-counting every carton and weight. A sheet with a unit price
+  is an invoice.
+- A totals row announcing itself as `TOTAL` in a label column was read as a line
+  item for a part called "TOTAL".
+- `PACKING/WEIGHT LIST` was not recognized as a packing list.
+
 ## v1.1.0 — 2026-08-14
 
 ### Added

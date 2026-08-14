@@ -24,12 +24,14 @@ own subfolder under input\\ to process several in one go.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import re
 import sys
 import traceback
 import warnings
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -72,8 +74,12 @@ COUNTRY_ISO = {
 # Packing-list header keywords -> canonical column. First header whose
 # normalized text contains any of these tokens wins.
 PL_COLUMN_TOKENS = {
-    "po":          ["purchasedorder", "purchaseorder", "po#", "pono", "order#"],
-    "part":        ["materialno", "material", "partno", "part#", "sku", "item#"],
+    "po":          ["purchasedorder", "purchaseorder", "po#", "pono", "p/o", "order#"],
+    # 'cus.partid' first and no bare 'item': a sheet with both 'Cus. Part ID'
+    # (the Kohler part) and 'Solex Item' (the supplier's own code) must pick the
+    # Kohler one, since that is what the parts database is keyed on.
+    "part":        ["cus.partid", "custpartid", "partid", "materialno", "partno",
+                    "itemno", "material", "part#", "sku", "item#"],
     "description": ["description", "descripcion"],
     "qty":         ["qty", "quantity", "pcs", "cantidad"],
     "hs":          ["hsncode", "hscode", "hsn", "hs", "tariff", "fraccion"],
@@ -81,8 +87,21 @@ PL_COLUMN_TOKENS = {
     # variants ('G.W/CTN') are filtered out before these are applied.
     "gross":       ["grossweight", "gross", "g.w", "gw(", "pesobruto"],
     "net":         ["netweight", "net", "n.w", "nw(", "pesoneto"],
-    "volume":      ["volume", "cbm", "volumen"],
+    "volume":      ["volume", "cbm", "volumen", "meas", "mea."],
     "cartons":     ["carton", "ctn", "cajas", "bultos", "package"],
+}
+
+# Commercial invoices that arrive as a spreadsheet rather than a PDF. Same
+# keyword idea as the packing list, different columns.
+INV_COLUMN_TOKENS = {
+    "po":          ["po/no", "po#", "pono", "purchaseorder", "purchasedorder", "p/o"],
+    "part":        ["cus.partid", "custpartid", "partid", "materialno", "partno",
+                    "itemno", "material", "part#", "sku"],
+    "description": ["description", "descripcion"],
+    "qty":         ["qty", "quantity", "cantidad"],
+    "price":       ["unitprice", "priceeach", "price"],
+    "amount":      ["amount", "extendedvalue", "exttotal", "importe"],
+    "hs":          ["hscode", "hsno", "tariff"],
 }
 
 # ---------------------------------------------------------------------------
@@ -435,6 +454,119 @@ def parse_invoices(path: Path) -> InvoiceDoc:
 
 
 # ---------------------------------------------------------------------------
+# Invoices, spreadsheet form
+#
+# Several suppliers send the commercial invoice as a worksheet rather than a
+# PDF, often in the same workbook as the packing list (one sheet each), and
+# sometimes as two invoice sheets covering one shipment. The table is found by
+# its header keywords, so a new supplier's column order costs nothing.
+# ---------------------------------------------------------------------------
+def _labelled_value(df: pd.DataFrame, pattern: str, limit: int = 40) -> str:
+    """Find a label like 'Invoice No:' or 'Country of Origin:' and return the
+    value printed beside it (or just below), which is where these headers put
+    it. Returns '' when the label is absent."""
+    rx = re.compile(pattern, re.I)
+    for r in range(min(limit, len(df))):
+        for c in range(df.shape[1]):
+            v = df.iat[r, c]
+            if v is None or not rx.search(str(v)):
+                continue
+            for cc in range(c + 1, df.shape[1]):          # to the right
+                nxt = df.iat[r, cc]
+                if nxt is not None and str(nxt).strip() and str(nxt).strip().lower() != "nan":
+                    return str(nxt).strip()
+            for rr in range(r + 1, min(r + 3, len(df))):  # or underneath
+                nxt = df.iat[rr, c]
+                if nxt is not None and str(nxt).strip() and str(nxt).strip().lower() != "nan":
+                    return str(nxt).strip()
+            # 'MADE IN CHINA' carries the value in the same cell as the label
+            m = re.search(r"made\s+in\s+([A-Za-z ]+)", str(v), re.I)
+            if m:
+                return m.group(1).strip()
+    return ""
+
+
+def parse_invoices_excel(path: Path) -> InvoiceDoc:
+    """Read commercial invoice line items from a workbook. Every sheet holding
+    an invoice table is read; a workbook with 'CI 1' and 'CI 2' is two invoices
+    for one shipment and both belong in the same summary."""
+    doc = InvoiceDoc(path=path)
+    xl = pd.ExcelFile(path, engine="xlrd" if path.suffix.lower() == ".xls" else "openpyxl")
+
+    for sheet in xl.sheet_names:
+        df = _read_sheet(path, sheet)
+        hit = _find_header(df, INV_COLUMN_TOKENS, {"po", "part", "qty", "amount"})
+        if not hit:
+            continue
+        hstart, hspan, cols = hit
+        # A packing sheet can also show PO/part/qty/amount-ish columns; what it
+        # never has is a price per unit. Require one so the packing sheet in the
+        # same workbook is not read as a second invoice.
+        if "price" not in cols:
+            continue
+
+        invoice_no = _labelled_value(df, r"invoice\s*(?:no|number|#)") or path.stem
+        country = _labelled_value(df, r"country\s+of\s+origin|made\s+in\s+")
+
+        def cell(r: int, name: str):
+            idx = cols.get(name)
+            return df.iat[r, idx] if idx is not None and idx < df.shape[1] else None
+
+        n_before = len(doc.lines)
+        printed_total = None
+        for r in range(hstart + hspan, len(df)):
+            row_text = " ".join(str(v) for v in df.iloc[r] if v is not None
+                                and str(v).strip().lower() != "nan")
+            if re.match(r"\s*(total|grand\s*total|say\s+total)\b", row_text, re.I):
+                amt = _num(cell(r, "amount"))
+                if amt is not None:
+                    printed_total = amt
+                continue
+
+            po = _norm_key(cell(r, "po"))
+            part = _norm_key(cell(r, "part"))
+            qty = _num(cell(r, "qty"))
+            amount = _num(cell(r, "amount"))
+            price = _num(cell(r, "price"))
+            if po.lower() in {"nan", "none"}:
+                po = ""
+            if part.lower() in {"nan", "none"}:
+                part = ""
+            if not part or qty is None or amount is None:
+                continue
+
+            hs = str(cell(r, "hs") or "").strip()
+            if hs.lower() in {"nan", "none"}:
+                hs = ""
+            hs = re.sub(r"\.0+$", "", hs)   # '84819090.00' is a code, not a number
+            doc.lines.append(InvoiceLine(
+                invoice=invoice_no, po=po, item=str(r),
+                part=part, qty=qty,
+                unit_price=price if price is not None else (amount / qty if qty else 0.0),
+                ext_total=amount, invoice_hs=hs,
+                country_raw=country, page=xl.sheet_names.index(sheet) + 1,
+            ))
+
+        if len(doc.lines) > n_before:
+            doc.invoice_pages += 1
+            if printed_total is not None:
+                ours = round(sum(l.ext_total for l in doc.lines[n_before:]), 2)
+                if abs(ours - printed_total) > 0.02:
+                    doc.page_total_mismatches.append(
+                        f"sheet '{sheet}' (invoice {invoice_no}): lines sum to "
+                        f"{ours:,.2f} but the sheet's total says {printed_total:,.2f}")
+                else:
+                    # The sheet's own total is this document's roll-up; record it
+                    # so the summary check has something to verify against.
+                    doc.summary_totals[f"{invoice_no}/{sheet}"] = printed_total
+
+    if not doc.lines:
+        raise RuntimeError(f"{path.name}: no invoice line items found "
+                           f"(needs PO, part, qty, unit price and amount columns)")
+    return doc
+
+
+# ---------------------------------------------------------------------------
 # Packing list
 # ---------------------------------------------------------------------------
 @dataclass
@@ -468,22 +600,70 @@ def _read_sheet(path: Path, sheet) -> pd.DataFrame:
     return pd.read_excel(path, sheet_name=sheet, header=None, dtype=object, engine=engine)
 
 
-def _map_pl_columns(header_row: list[object]) -> dict[str, int]:
-    """Map canonical names to column indexes by keyword. Longer tokens are
-    tried first so 'grossweight' can't be claimed by the bare 'gross' rule."""
+def _map_columns(header_row: list[object], token_map: dict[str, list[str]]) -> dict[str, int]:
+    """Map canonical names to column indexes by keyword. Tokens are tried in the
+    order listed, most specific first, so 'grossweight' can't be claimed by the
+    bare 'gross' rule and 'Solex Item' can't be claimed ahead of 'Cus. Part ID'.
+    Per-carton columns ('N.W/CTN') are never eligible: they are per-unit figures,
+    not row totals."""
     normed = ["".join(str(h).lower().split()) if h is not None else "" for h in header_row]
     found: dict[str, int] = {}
-    for canon, tokens in PL_COLUMN_TOKENS.items():
+    for canon, tokens in token_map.items():
         for tok in tokens:
-            for idx, h in enumerate(normed):
-                if idx in found.values():
-                    continue
-                if tok in h:
-                    found[canon] = idx
-                    break
-            if canon in found:
-                break
+            candidates = [idx for idx, h in enumerate(normed)
+                          if h and idx not in found.values()
+                          and not any(m in h for m in PL_PER_UNIT_MARKERS)
+                          and tok in h]
+            if not candidates:
+                continue
+            # The best match is the column whose header is CLOSEST to the token,
+            # not the leftmost one containing it. One supplier leaves a stray
+            # 'PO#' label above an unrelated column; taking it in preference to
+            # the real 'PO #' header mapped the PO onto an empty column and
+            # every join then failed.
+            found[canon] = min(candidates, key=lambda i: (len(normed[i]), i))
+            break
     return found
+
+
+def _map_pl_columns(header_row: list[object]) -> dict[str, int]:
+    return _map_columns(header_row, PL_COLUMN_TOKENS)
+
+
+def _merge_header_rows(df: pd.DataFrame, start: int, span: int) -> list[object]:
+    """Join `span` consecutive rows into one header line, per column.
+
+    A spreadsheet header is often stacked: 'QTY' over '(PCS)', or 'N.W.' over
+    '(KGS)', and one template puts 'HS CODE' two rows below its neighbours.
+    Reading a single row would leave those columns unnamed."""
+    out: list[object] = []
+    for c in range(df.shape[1]):
+        parts = []
+        for r in range(start, min(start + span, len(df))):
+            v = df.iat[r, c]
+            if v is not None and str(v).strip() and str(v).strip().lower() != "nan":
+                parts.append(str(v).strip())
+        out.append(" ".join(parts))
+    return out
+
+
+def _find_header(df: pd.DataFrame, token_map: dict[str, list[str]],
+                 required: set[str], scan: int = 40) -> tuple[int, int, dict[str, int]] | None:
+    """Locate a table header, allowing it to span up to 3 rows. Returns
+    (first row, rows used, column map) for the mapping that names the most
+    columns -- more named columns means the header was read correctly."""
+    best: tuple[int, int, int, dict[str, int]] | None = None
+    for r in range(min(scan, len(df))):
+        for span in (1, 2, 3):
+            cols = _map_columns(_merge_header_rows(df, r, span), token_map)
+            if not required <= set(cols):
+                continue
+            score = len(cols)
+            if best is None or score > best[0]:
+                best = (score, r, span, cols)
+    if best is None:
+        return None
+    return best[1], best[2], best[3]
 
 
 def parse_packing_list(path: Path) -> PackingList:
@@ -496,22 +676,65 @@ def parse_packing_list(path: Path) -> PackingList:
     pl = PackingList(path=path)
     xl = pd.ExcelFile(path, engine="xlrd" if path.suffix.lower() == ".xls" else "openpyxl")
 
-    best = None
+    # Read EVERY packing sheet in the workbook. One supplier splits a shipment
+    # across 'PK40GP1' and 'PK40GP2'; reading only the best-scoring sheet would
+    # silently drop half the shipment's weights.
+    sheets: list[tuple[str, pd.DataFrame, int, int, dict[str, int]]] = []
     for sheet in xl.sheet_names:
         df = _read_sheet(path, sheet)
-        for r in range(min(40, len(df))):
-            cols = _map_pl_columns(list(df.iloc[r]))
-            if {"po", "part", "qty"} <= set(cols):
-                best = (sheet, df, r, cols)
-                break
-        if best:
-            break
-    if not best:
+        hit = _find_header(df, PL_COLUMN_TOKENS, {"po", "part", "qty"})
+        # PO + part + qty alone describes an invoice table just as well as a
+        # packing one. What makes it a packing list is weights or cartons;
+        # without them an invoice sheet gets read as a packing list with no
+        # weights, which silently suppresses the "no packing list" warning.
+        if not hit or not ({"gross", "net", "cartons"} & set(hit[2])):
+            continue
+        # An invoice sheet in the same workbook often carries a cartons column
+        # too. What it has and a packing sheet never does is a unit price --
+        # without this test the invoice sheet is read as a second packing sheet
+        # and every carton and weight is counted twice.
+        inv = _find_header(df, INV_COLUMN_TOKENS, {"po", "part", "qty", "amount"})
+        if inv and "price" in inv[2]:
+            continue
+        sheets.append((sheet, df, hit[0], hit[1], hit[2]))
+    if not sheets:
         raise RuntimeError(f"{path.name}: could not find a packing-list header row "
-                           f"(need Purchase Order / Material / Qty columns)")
+                           f"(need Purchase Order / Material / Qty columns, plus "
+                           f"weights or cartons)")
 
-    sheet, df, hrow, cols = best
+    group = -1
+    carton_values: list[float] = []
+    for sheet, df, hstart, hspan, cols in sheets:
+        hrow = hstart + hspan - 1
+        group, extra = _read_packing_sheet(pl, df, hrow, cols, group)
+        carton_values.extend(extra)
 
+    if pl.cartons is None and carton_values:
+        distinct = {round(v, 4) for v in carton_values}
+        if len(distinct) == 1 and len(carton_values) < len(pl.rows):
+            # One number for the whole shipment, printed on the first row --
+            # summing the column here would double-count it.
+            pl.cartons = carton_values[0]
+            pl.carton_source = "single shipment-wide carton figure"
+        else:
+            pl.cartons = sum(carton_values)
+            pl.carton_source = "sum of the per-row carton column"
+
+    # An HS group whose code is not constant means the group boundaries (drawn
+    # from where weights are stated) don't line up with the tariff grouping.
+    for g in sorted(pl.group_gross):
+        codes = {r.hs for r in pl.rows if r.group == g and r.hs}
+        if len(codes) > 1:
+            pl.notes.append(f"weight group {g + 1} spans more than one HS code: "
+                            f"{', '.join(sorted(codes))}")
+    return pl
+
+
+def _read_packing_sheet(pl: PackingList, df: pd.DataFrame, hrow: int,
+                        cols: dict[str, int], group: int) -> tuple[int, list[float]]:
+    """Read one packing sheet's rows into `pl`, continuing the weight-group
+    numbering from `group`. Returns the new group counter and the carton
+    figures seen, which the caller needs to decide how to read the column."""
     # Shipment number, printed above the table.
     for r in range(hrow + 1):
         for c in range(df.shape[1]):
@@ -530,7 +753,6 @@ def parse_packing_list(path: Path) -> PackingList:
         idx = cols.get(name)
         return df.iat[r, idx] if idx is not None and idx < df.shape[1] else None
 
-    group = -1
     carton_values: list[float] = []
     for r in range(hrow + 1, len(df)):
         po = _norm_key(cell(r, "po")) if cell(r, "po") is not None else ""
@@ -542,14 +764,37 @@ def parse_packing_list(path: Path) -> PackingList:
         po = "" if po.lower() in {"nan", "none"} else po
         part = "" if part.lower() in {"nan", "none"} else part
 
+        # A totals row can also announce itself in words -- 'TOTAL' printed in
+        # the PO column, or in a label column to its left. Without this the row
+        # is read as a line item for a part called 'TOTAL'.
+        row_text = " ".join(str(v) for v in df.iloc[r] if v is not None
+                            and str(v).strip().lower() != "nan")
+        if re.match(r"\s*(total|grand\s*total|say\s+total)\b", row_text, re.I):
+            if qty is not None:
+                # Accumulate: a shipment split across two packing sheets prints
+                # a total on each, and only their sum describes the shipment.
+                pl.total_qty = (pl.total_qty or 0.0) + qty
+                if gross is not None:
+                    pl.total_gross = (pl.total_gross or 0.0) + gross
+                if net is not None:
+                    pl.total_net = (pl.total_net or 0.0) + net
+                if ctn is not None:
+                    pl.cartons = (pl.cartons or 0.0) + ctn
+                    pl.carton_source = "packing-list total row"
+            continue
+
         if not po and not part:
             # Trailing totals row: no PO, no part, but the columns still add up.
             if qty is not None:
-                pl.total_qty = qty
-                pl.total_gross = gross
-                pl.total_net = net
+                # Accumulate: a shipment split across two packing sheets prints
+                # a total on each, and only their sum describes the shipment.
+                pl.total_qty = (pl.total_qty or 0.0) + qty
+                if gross is not None:
+                    pl.total_gross = (pl.total_gross or 0.0) + gross
+                if net is not None:
+                    pl.total_net = (pl.total_net or 0.0) + net
                 if ctn is not None:
-                    pl.cartons = ctn
+                    pl.cartons = (pl.cartons or 0.0) + ctn
                     pl.carton_source = "packing-list total row"
             continue
         if qty is None:
@@ -558,11 +803,11 @@ def parse_packing_list(path: Path) -> PackingList:
         if gross is not None:
             group += 1
             pl.group_gross[group] = gross
-            pl.group_net[group] = net if net is not None else 0.0
+            pl.group_net[group] = net
         if group < 0:  # rows before any stated weight
             group = 0
             pl.group_gross.setdefault(group, 0.0)
-            pl.group_net.setdefault(group, 0.0)
+            pl.group_net.setdefault(group, None)
         if ctn is not None:
             carton_values.append(ctn)
 
@@ -571,25 +816,7 @@ def parse_packing_list(path: Path) -> PackingList:
             hs=str(cell(r, "hs") or "").strip(), group=group, cartons=ctn,
         ))
 
-    if pl.cartons is None and carton_values:
-        distinct = {round(v, 4) for v in carton_values}
-        if len(distinct) == 1:
-            # One number for the whole shipment, printed on the first row --
-            # summing the column here would double-count it.
-            pl.cartons = carton_values[0]
-            pl.carton_source = "single shipment-wide carton figure"
-        else:
-            pl.cartons = sum(carton_values)
-            pl.carton_source = "sum of the per-row carton column"
-
-    # An HS group whose code is not constant means the group boundaries (drawn
-    # from where weights are stated) don't line up with the tariff grouping.
-    for g in sorted(pl.group_gross):
-        codes = {r.hs for r in pl.rows if r.group == g and r.hs}
-        if len(codes) > 1:
-            pl.notes.append(f"weight group {g + 1} spans more than one HS code: "
-                            f"{', '.join(sorted(codes))}")
-    return pl
+    return group, carton_values
 
 
 # ---------------------------------------------------------------------------
@@ -613,6 +840,20 @@ PL_PER_UNIT_MARKERS = ("/ctn", "/ ctn", "perctn", "/carton", "/box", "percarton"
 # of the same header cell rather than two columns. A word space is ~2-3pt here;
 # the narrowest real gutter observed is 8pt.
 HEADER_WORD_GAP = 6.0
+
+
+def _money(text: object) -> float | None:
+    """'US$12,150.00' -> 12150.0. Currency marks and thousands separators are
+    presentation; the number underneath is what matters."""
+    if text is None:
+        return None
+    s = re.sub(r"[^\d.\-]", "", str(text).replace(",", ""))
+    if not s or s in {".", "-"}:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
 
 
 def _lead_num(text: object) -> float | None:
@@ -803,11 +1044,11 @@ def parse_packing_list_pdf(path: Path) -> PackingList:
                 if gross is not None:
                     group += 1
                     pl.group_gross[group] = gross
-                    pl.group_net[group] = net if net is not None else 0.0
+                    pl.group_net[group] = net
                 elif group < 0:
                     group = 0
                     pl.group_gross.setdefault(group, 0.0)
-                    pl.group_net.setdefault(group, 0.0)
+                    pl.group_net.setdefault(group, None)
 
                 pl.rows.append(PackingRow(
                     po=_norm_key(val(cells, "po")),
@@ -867,7 +1108,8 @@ def parse_packing_list_pdf(path: Path) -> PackingList:
     row_cartons = [r.cartons for r in pl.rows if r.cartons is not None]
     check("quantity", sum(r.qty for r in pl.rows), stated["qty"], 0.5)
     check("gross weight", sum(pl.group_gross.values()), stated["gross"], 0.05)
-    check("net weight", sum(pl.group_net.values()), stated["net"], 0.05)
+    check("net weight", sum(v for v in pl.group_net.values() if v is not None),
+          stated["net"], 0.05)
     if len(row_cartons) == len(pl.rows) and row_cartons:
         check("carton count", sum(row_cartons), stated["cartons"], 0.5)
 
@@ -894,6 +1136,102 @@ def parse_packing_list_pdf(path: Path) -> PackingList:
     if m and re.search(r"\d", m.group(1)):
         pl.shipment_no = m.group(1).strip(":#.,")
     return pl
+
+
+def parse_invoices_pdf_table(path: Path) -> InvoiceDoc:
+    """
+    Read a PDF invoice laid out as a table rather than as the classic
+    one-invoice-per-page form -- same geometric approach as the PDF packing
+    list, and often the very same supplier template with different columns.
+    """
+    import pdfplumber
+
+    doc = InvoiceDoc(path=path)
+    header_cols: list[dict] = []
+    cols_map: dict[str, int] = {}
+    invoice_no = ""
+    country = ""
+
+    with pdfplumber.open(str(path)) as pdf:
+        for page in pdf.pages:
+            lines = _cluster_lines(page.extract_words())
+            if not lines:
+                continue
+            text = "\n".join(" ".join(w["text"] for w in ln) for ln in lines)
+            if not invoice_no:
+                m = re.search(r"invoice\s*(?:no|number|#)\.?\s*[:.]?\s*(\S+)", text, re.I)
+                if m:
+                    invoice_no = m.group(1).strip(":#.,")
+            if not country:
+                m = re.search(r"(?:country\s+of\s+origin|made\s+in)\s*[:.]?\s*([A-Za-z ]+)",
+                              text, re.I)
+                if m:
+                    country = m.group(1).strip()
+
+            best = None
+            for start in range(min(len(lines), 60)):
+                for span in range(1, 5):
+                    if start + span > len(lines):
+                        break
+                    cols = _header_columns(lines[start:start + span])
+                    mapped = _map_columns([c["text"] for c in cols], INV_COLUMN_TOKENS)
+                    if {"qty", "amount"} <= set(mapped) and (best is None
+                                                             or len(mapped) > best[0]):
+                        best = (len(mapped), cols, mapped)
+            if best and best[0] >= 3:
+                header_cols, cols_map = best[1], best[2]
+                header_bottom = max(w["bottom"] for c in header_cols for w in c["words"])
+            elif header_cols:
+                header_bottom = 0.0
+            else:
+                continue
+
+            def val(cells: dict[int, str], name: str) -> str:
+                idx = cols_map.get(name)
+                return cells.get(idx, "") if idx is not None else ""
+
+            data: list[tuple[float, dict[int, str]]] = []
+            loose: list[tuple[float, str]] = []
+            for line in lines:
+                if line[0]["top"] <= header_bottom:
+                    continue
+                cells = _assign_columns(header_cols, line)
+                row_text = " ".join(w["text"] for w in line)
+                if re.match(r"\s*(total|grand\s*total|say\s+total)", row_text, re.I):
+                    continue
+                if _money(val(cells, "amount")) is None or _lead_num(val(cells, "qty")) is None:
+                    loose.append((line[0]["top"], val(cells, "description") or row_text))
+                else:
+                    data.append((line[0]["top"], cells))
+
+            extra: dict[int, list[str]] = {}
+            for top, desc in loose:
+                if not data:
+                    break
+                i = min(range(len(data)), key=lambda k: abs(data[k][0] - top))
+                extra.setdefault(i, []).append(desc)
+
+            for i, (_, cells) in enumerate(data):
+                description = " ".join([val(cells, "description")] + extra.get(i, [])).strip()
+                part = _norm_key(val(cells, "part")) or _part_from_text(description)
+                qty = _lead_num(val(cells, "qty"))
+                amount = _money(val(cells, "amount"))
+                price = _money(val(cells, "price"))
+                if not part or qty is None or amount is None:
+                    continue
+                doc.lines.append(InvoiceLine(
+                    invoice=invoice_no or path.stem, po=_norm_key(val(cells, "po")),
+                    item=str(i + 1), part=part, qty=qty,
+                    unit_price=price if price is not None else (amount / qty if qty else 0.0),
+                    ext_total=amount, invoice_hs=re.sub(r"\D", "", val(cells, "hs")),
+                    country_raw=country, page=1,
+                ))
+            if doc.lines:
+                doc.invoice_pages += 1
+
+    if not doc.lines:
+        raise RuntimeError(f"{path.name}: no invoice line items could be read")
+    return doc
 
 
 # ---------------------------------------------------------------------------
@@ -1176,72 +1514,83 @@ class ShipmentResult:
     estimated_groups: list[str] = field(default_factory=list)
 
 
-def join_invoice_to_packing(lines: list[InvoiceLine], pl: PackingList,
-                            res: ShipmentResult) -> dict[int, PackingRow]:
+def join_by_bucket(lines: list[InvoiceLine], pl: PackingList,
+                   res: ShipmentResult) -> dict[str, str]:
     """
-    Match every invoice line to its packing-list row on (PO, part, qty) and
-    return {index into lines -> the packing row it matched}.
+    Reconcile the invoice against the packing list at the (PO, part) level and
+    return {packing part number -> invoice part number} for any that differ.
+
+    Matching per LINE is wrong: the two documents agree on what shipped, not on
+    how it was written down. One supplier splits a part across four invoice
+    lines and two packing rows; another prints one row per pallet. Both sides
+    are therefore totalled per (PO, part) and compared there.
 
     Never joins by row position: documents do not share a row order (TRAP 2).
     Hand-keyed part numbers carry typos (TRAP 3), so an unmatched part is
     retried punctuation-blind and then at edit distance 1 -- accepted only when
     exactly one candidate fits, and every rewrite is reported.
     """
-    by_triple: dict[tuple, list[PackingRow]] = {}
+    po_on_packing = any(r.po for r in pl.rows)
+    if not po_on_packing:
+        res.notes.append("the packing list states no purchase order, so line items were "
+                         "matched on part number alone")
+
+    def bucket(po: str, part: str) -> tuple:
+        return (po if po_on_packing else "", part)
+
+    inv_qty: dict[tuple, float] = {}
+    for ln in lines:
+        k = bucket(ln.po, ln.part)
+        inv_qty[k] = inv_qty.get(k, 0.0) + ln.qty
+    pack_qty: dict[tuple, float] = {}
     for row in pl.rows:
-        by_triple.setdefault((row.po, row.part, row.qty), []).append(row)
+        k = bucket(row.po, row.part)
+        pack_qty[k] = pack_qty.get(k, 0.0) + row.qty
 
-    matched: dict[int, PackingRow] = {}
-    for i, ln in enumerate(lines):
-        cand = by_triple.get((ln.po, ln.part, ln.qty), [])
-        row = next((r for r in cand if not r.consumed), None)
+    alias: dict[str, str] = {}
+    unmatched_pack = [k for k in pack_qty if k not in inv_qty]
+    unmatched_inv = [k for k in inv_qty if k not in pack_qty]
 
-        if row is None:  # same PO+part, different qty
-            same = [r for r in pl.rows
-                    if not r.consumed and r.po == ln.po and r.part == ln.part]
-            if len(same) == 1:
-                row = same[0]
-                res.warnings.append(
-                    f"invoice {ln.invoice} PO {ln.po} part {ln.part}: invoice qty "
-                    f"{ln.qty:,.0f} vs packing list {row.qty:,.0f} -- matched anyway")
+    # Resolve the leftovers against each other by part number, tolerating the
+    # punctuation and single-character typos that hand-keying introduces.
+    for pk in list(unmatched_pack):
+        hits = [ik for ik in unmatched_inv
+                if (not po_on_packing or ik[0] == pk[0])
+                and (_depunct(ik[1]) == _depunct(pk[1])
+                     or _edit_distance_1(_depunct(ik[1]), _depunct(pk[1])))]
+        if len(hits) == 1:
+            alias[pk[1]] = hits[0][1]
+            res.warnings.append(f"part number rewritten for matching: packing list "
+                                f"'{pk[1]}' -> invoice '{hits[0][1]}'")
+            inv_qty[pk] = inv_qty.pop(hits[0])
+            unmatched_inv.remove(hits[0])
+            unmatched_pack.remove(pk)
 
-        if row is None:  # typo'd part number
-            pool = [r for r in pl.rows if not r.consumed and r.po == ln.po]
-            hits = [r for r in pool if _depunct(r.part) == _depunct(ln.part)]
-            if not hits:
-                hits = [r for r in pool if _edit_distance_1(_depunct(r.part), _depunct(ln.part))]
-            if len(hits) == 1:
-                row = hits[0]
-                res.warnings.append(
-                    f"part number rewritten for matching: invoice '{ln.part}' -> "
-                    f"packing list '{row.part}' (PO {ln.po}, invoice {ln.invoice})")
-            elif len(hits) > 1:
-                res.problems.append(
-                    f"invoice {ln.invoice} part {ln.part}: {len(hits)} possible packing-list "
-                    f"rows, none unique -- left unmatched")
-
-        if row is None:
+    for k in unmatched_inv:
+        res.problems.append(f"invoice PO {k[0] or '(none)'} part {k[1]} "
+                            f"({inv_qty[k]:,.0f} pcs): nothing on the packing list")
+    for k in unmatched_pack:
+        res.problems.append(f"packing list PO {k[0] or '(none)'} part {k[1]} "
+                            f"({pack_qty[k]:,.0f} pcs): nothing on the invoices")
+    for k in inv_qty:
+        if k in pack_qty and abs(inv_qty[k] - pack_qty[k]) > 0.5:
             res.problems.append(
-                f"invoice {ln.invoice} PO {ln.po} part {ln.part} qty {ln.qty:,.0f}: "
-                f"no packing-list row")
-            continue
-
-        row.consumed = True
-        matched[i] = row
-
-    for row in pl.rows:
-        if not row.consumed:
-            res.problems.append(
-                f"packing-list row PO {row.po} part {row.part} qty {row.qty:,.0f}: "
-                f"no invoice line")
-    return matched
+                f"PO {k[0] or '(none)'} part {k[1]}: invoice says {inv_qty[k]:,.0f} pcs, "
+                f"packing list says {pack_qty[k]:,.0f}")
+    return alias
 
 
 def build_rows(lines: list[InvoiceLine], pl: PackingList | None,
-               matched: dict[int, PackingRow], db: PartsDB,
+               alias: dict[str, str], db: PartsDB,
                res: ShipmentResult) -> list[dict]:
-    """Aggregate to one row per part, allocating weight inside each HS group."""
-    # Per (group, part): qty and value.
+    """Aggregate to one row per part, allocating weight inside each HS group.
+
+    Weights and cartons are read from the PACKING rows directly rather than
+    through the invoice lines. The packing list is the document that states
+    what physically shipped, and it is free to break a part across a different
+    number of rows than the invoice uses -- per pallet, per carton type, per
+    container. Reading it on its own terms removes that mismatch entirely.
+    """
     per_group: dict[int, dict[str, dict]] = {}
     per_part: dict[str, dict] = {}
     for i, ln in enumerate(lines):
@@ -1254,11 +1603,13 @@ def build_rows(lines: list[InvoiceLine], pl: PackingList | None,
         if ln.invoice_hs:
             p["inv_hs"].add(ln.invoice_hs)
 
-        prow = matched.get(i)
-        if prow is None:
-            continue
-        gp = per_group.setdefault(prow.group, {}).setdefault(ln.part, {"qty": 0.0})
-        gp["qty"] += ln.qty
+
+    # Piece counts per (weight group, part), straight off the packing list.
+    if pl is not None:
+        for row in pl.rows:
+            part = alias.get(row.part, row.part)
+            gp = per_group.setdefault(row.group, {}).setdefault(part, {"qty": 0.0})
+            gp["qty"] += row.qty
 
     gross_by_part: dict[str, float] = {}
     net_by_part: dict[str, float] = {}
@@ -1267,13 +1618,35 @@ def build_rows(lines: list[InvoiceLine], pl: PackingList | None,
             names = list(parts)
             qtys = [parts[n]["qty"] for n in names]
             gross = allocate_largest_remainder(pl.group_gross.get(g, 0.0), qtys)
-            net = allocate_largest_remainder(pl.group_net.get(g, 0.0), qtys)
-            for n, gv, nv in zip(names, gross, net):
+            for n, gv in zip(names, gross):
                 gross_by_part[n] = round(gross_by_part.get(n, 0.0) + gv, 2)
-                net_by_part[n] = round(net_by_part.get(n, 0.0) + nv, 2)
+            # A document that states no net weight leaves the column blank
+            # rather than repeating gross or writing a zero it cannot support.
+            group_net_total = pl.group_net.get(g)
+            if group_net_total is not None:
+                for n, nv in zip(names, allocate_largest_remainder(group_net_total, qtys)):
+                    net_by_part[n] = round(net_by_part.get(n, 0.0) + nv, 2)
             label = (f"group {g + 1} ({pl.group_gross.get(g, 0.0):,.2f} kg gross, "
                      f"{len(names)} part(s))")
             (res.exact_groups if len(names) == 1 else res.estimated_groups).append(label)
+
+    # True-up. Each group's split is exact within that group, but the group
+    # totals are themselves rounded to the cent, so a shipment with fifty
+    # single-row groups can drift a few cents from the figure printed on the
+    # packing list. Push the residual onto the heaviest rows -- the same
+    # largest-remainder principle, applied once at the file level.
+    if pl is not None:
+        for stated, by_part in ((pl.total_gross, gross_by_part),
+                                (pl.total_net, net_by_part)):
+            if stated is None or not by_part:
+                continue
+            drift = int(round(stated * 100)) - int(round(sum(by_part.values()) * 100))
+            if drift == 0:
+                continue
+            order = sorted(by_part, key=lambda n: -by_part[n])
+            step = 1 if drift > 0 else -1
+            for n in (order * (abs(drift) // len(order) + 1))[:abs(drift)]:
+                by_part[n] = round(by_part[n] + step / 100.0, 2)
 
     rows: list[dict] = []
     for part, agg in per_part.items():
@@ -1312,6 +1685,18 @@ def build_rows(lines: list[InvoiceLine], pl: PackingList | None,
 
     rows.sort(key=lambda r: r["Value"], reverse=True)
 
+    # Value gets the same true-up as the weights: rounding each part's total to
+    # the cent can leave the column a cent away from the invoice grand total,
+    # and a customs file should tie to the invoice exactly.
+    if rows:
+        target = int(round(sum(l.ext_total for l in lines) * 100))
+        drift = target - int(round(sum(r["Value"] for r in rows) * 100))
+        if 0 < abs(drift) <= max(10, len(rows)):
+            step = 1 if drift > 0 else -1
+            for i in range(abs(drift)):
+                r = rows[i % len(rows)]
+                r["Value"] = round(r["Value"] + step / 100.0, 2)
+
     # Cartons. Most paperwork gives a shipment TOTAL only, in which case the
     # whole total sits on the first row: the column still ties out and nothing
     # is invented. Some templates do state a count per line, and those are used
@@ -1319,15 +1704,11 @@ def build_rows(lines: list[InvoiceLine], pl: PackingList | None,
     # shipment total, so a partly-filled column can never masquerade as exact.
     if pl is not None and rows:
         per_part: dict[str, float] = {}
-        usable = bool(matched) and all(r.cartons is not None for r in matched.values())
+        usable = bool(pl.rows) and all(r.cartons is not None for r in pl.rows)
         if usable:
-            counted: set[int] = set()          # a packing row's cartons count once
-            for i, ln in enumerate(lines):
-                prow = matched.get(i)
-                if prow is None or id(prow) in counted:
-                    continue
-                counted.add(id(prow))
-                per_part[ln.part] = per_part.get(ln.part, 0.0) + prow.cartons
+            for row in pl.rows:
+                part = alias.get(row.part, row.part)
+                per_part[part] = per_part.get(part, 0.0) + row.cartons
             total = sum(per_part.values())
             if pl.cartons is not None and abs(total - pl.cartons) > 0.5:
                 res.warnings.append(
@@ -1408,13 +1789,18 @@ def reconcile(doc: InvoiceDoc, pl: PackingList | None, rep: ReceptionReport | No
             res.problems.append(f"packing-list rows sum to {pl_qty:,.0f} but its total row "
                                 f"says {pl.total_qty:,.0f}")
         group_gross = round(sum(pl.group_gross.values()), 2)
-        group_net = round(sum(pl.group_net.values()), 2)
+        group_net = round(sum(v for v in pl.group_net.values() if v is not None), 2)
         if pl.total_gross is None:
             res.problems.append("packing list states no total gross weight")
         elif abs(group_gross - pl.total_gross) > 0.01:
             res.problems.append(f"HS-group gross weights sum to {group_gross:,.2f} but the "
                                 f"packing-list total is {pl.total_gross:,.2f}")
-        if pl.total_net is None:
+        if all(v is None for v in pl.group_net.values()):
+            # Not a failure to report as a discrepancy -- the document simply
+            # does not carry the figure. Say so plainly; the column is blank.
+            res.warnings.append("the packing list states no net weight at all, so the "
+                                "Net Weight column is blank for this shipment")
+        elif pl.total_net is None:
             res.problems.append("packing list states no total net weight")
         elif abs(group_net - pl.total_net) > 0.01:
             res.problems.append(f"HS-group net weights sum to {group_net:,.2f} but the "
@@ -1573,6 +1959,12 @@ def format_workbook(path: Path, n_rows: int) -> None:
 def classify(path: Path) -> str:
     """Identify a document by its CONTENT: filenames vary by client."""
     suffix = path.suffix.lower()
+    # Formats this tool never reads. Container inspection reports and photos
+    # travel with the paperwork; naming them keeps them out of the
+    # "unrecognized" list, which is meant for files that SHOULD have parsed.
+    if suffix in {".docx", ".doc", ".msg", ".eml", ".jpg", ".jpeg", ".png",
+                  ".txt", ".htm", ".html", ".xml", ".csv"}:
+        return "transport"
     if suffix == ".pdf":
         try:
             pages = extract_pdf_pages(path)
@@ -1581,6 +1973,13 @@ def classify(path: Path) -> str:
         head = "\n".join(pages[:3])
         if re.search(r"REPORTE\s+DE\s+RECEPCION|RECONOCIMIENTO\s+PREVIO", head, re.I):
             return "reception"
+        # Transport paperwork travels with every shipment and holds nothing this
+        # tool needs. Recognize it so it is skipped quietly instead of being
+        # reported as an unrecognized file the team has to look into.
+        if re.search(r"BILL\s+OF\s+LADING|NON-NEGOTIABLE\s+WAYBILL|SEA\s*WAYBILL|"
+                     r"FORWARDER'?S\s+CARGO\s+RECEIPT|TELEX\s+RELEASE|"
+                     r"ARRIVAL\s+NOTICE|BOOKING\s+CONFIRMATION", head, re.I):
+            return "transport"
         # A combined invoice+packing document (CIPL) is filed as invoices: the
         # invoice side is the one this tool cannot do without. process_shipment
         # then re-reads the same file for a packing table if none arrived
@@ -1589,24 +1988,60 @@ def classify(path: Path) -> str:
             return "invoices"
         if re.search(r"Invoice\s+Summary", head, re.I):
             return "invoices"
-        if re.search(r"PACKING\s*LIST", head, re.I):
+        if re.search(r"PACKING\s*(?:[/&]\s*WEIGHT\s*)?LIST", head, re.I):
             return "packing"
         return "unknown"
     if suffix in {".xls", ".xlsx", ".xlsm"}:
         try:
             xl = pd.ExcelFile(path, engine="xlrd" if suffix == ".xls" else "openpyxl")
-            for sheet in xl.sheet_names[:3]:
-                df = _read_sheet(path, sheet).head(40)
-                flat = " ".join(str(v).lower() for v in df.values.ravel())
+            has_invoice = has_packing = False
+            for sheet in xl.sheet_names:
+                df = _read_sheet(path, sheet)
+                flat = " ".join(str(v).lower() for v in df.head(40).values.ravel())
                 if "product key" in flat and "hts" in flat:
                     return "partsdb"
-                for r in range(len(df)):
-                    cols = _map_pl_columns(list(df.iloc[r]))
-                    if {"po", "part", "qty"} <= set(cols):
-                        return "packing"
+                inv = _find_header(df, INV_COLUMN_TOKENS, {"po", "part", "qty", "amount"})
+                if inv and "price" in inv[2]:
+                    has_invoice = True
+                pk = _find_header(df, PL_COLUMN_TOKENS, {"po", "part", "qty"})
+                if pk and ({"gross", "net", "cartons"} & set(pk[2])):
+                    has_packing = True
+            # A workbook holding both is filed as invoices -- the invoice side is
+            # the one the tool cannot do without. process_shipment re-reads the
+            # same workbook for its packing sheet.
+            if has_invoice:
+                return "invoices"
+            if has_packing:
+                return "packing"
         except Exception:
             return "unknown"
     return "unknown"
+
+
+def read_invoices(paths: list[Path]) -> InvoiceDoc:
+    """Read commercial invoices in whichever form they arrived, merging every
+    invoice document in the shipment. Suppliers routinely send one file per
+    invoice, and the customs file covers the whole shipment."""
+    merged = InvoiceDoc(path=paths[0])
+    for path in paths:
+        if path.suffix.lower() in {".xls", ".xlsx", ".xlsm"}:
+            doc = parse_invoices_excel(path)
+        else:
+            # The classic one-invoice-per-page layout first; suppliers who
+            # instead print a single table fall through to the geometric reader.
+            try:
+                doc = parse_invoices(path)
+                if not doc.lines:
+                    raise RuntimeError("no line items in the page layout")
+            except Exception:
+                doc = parse_invoices_pdf_table(path)
+        merged.lines.extend(doc.lines)
+        merged.summaries.extend(doc.summaries)
+        merged.summary_totals.update(doc.summary_totals)
+        merged.page_total_mismatches.extend(doc.page_total_mismatches)
+        merged.invoice_pages += doc.invoice_pages
+        merged.summary_pages += doc.summary_pages
+    return merged
 
 
 def read_packing_list(path: Path, res: ShipmentResult) -> PackingList | None:
@@ -1628,7 +2063,7 @@ def process_shipment(docs: dict[str, list[Path]], db: PartsDB,
     """Run one shipment end to end. Returns (problem count, message)."""
     res = ShipmentResult()
 
-    doc = parse_invoices(docs["invoices"][0])
+    doc = read_invoices(docs["invoices"])
     print(f"  invoices ....... {doc.invoice_pages} invoice page(s), {len(doc.lines)} line "
           f"item(s), {doc.summary_pages} summary page(s), "
           f"{len(doc.summary_totals)} summary set(s)")
@@ -1636,18 +2071,24 @@ def process_shipment(docs: dict[str, list[Path]], db: PartsDB,
         raise RuntimeError("no invoice line items could be parsed")
 
     pl = None
-    if docs["packing"]:
-        pl = read_packing_list(docs["packing"][0], res)
+    for candidate in docs["packing"]:
+        pl = read_packing_list(candidate, res)
+        if pl is not None:
+            break
     if pl is None:
-        # No usable packing list of its own. A combined invoice+packing PDF
-        # (CIPL) carries the table inside the invoice file, so try there before
-        # giving up on weights. Strictly validated, so a wrong guess cannot pass.
-        try:
-            pl = parse_packing_list_pdf(docs["invoices"][0])
-            print(f"  [INFO] packing table read from {docs['invoices'][0].name} "
-                  f"(combined invoice + packing list)")
-        except Exception:
-            pl = None
+        # No packing list of its own. A combined invoice+packing document
+        # carries the table inside the invoice file -- a workbook with one sheet
+        # each, or a CIPL PDF -- so look there before giving up on weights.
+        for inv_path in docs["invoices"]:
+            try:
+                pl = (parse_packing_list(inv_path)
+                      if inv_path.suffix.lower() in {".xls", ".xlsx", ".xlsm"}
+                      else parse_packing_list_pdf(inv_path))
+                print(f"  [INFO] packing table read from {inv_path.name} "
+                      f"(combined invoice + packing list)")
+                break
+            except Exception:
+                pl = None
     if pl is not None:
         print(f"  packing list ... {len(pl.rows)} row(s), {len(pl.group_gross)} weight "
               f"group(s), cartons {pl.cartons if pl.cartons is not None else 'n/a'}")
@@ -1658,8 +2099,8 @@ def process_shipment(docs: dict[str, list[Path]], db: PartsDB,
         print(f"  reception ...... {len(rep.rows)} row(s)"
               f"{', guide ' + rep.guide if rep.guide else ''}")
 
-    matched = join_invoice_to_packing(doc.lines, pl, res) if pl else {}
-    rows = build_rows(doc.lines, pl, matched, db, res)
+    alias = join_by_bucket(doc.lines, pl, res) if pl else {}
+    rows = build_rows(doc.lines, pl, alias, db, res)
     reconcile(doc, pl, rep, rows, res)
 
     shipment = (pl.shipment_no if pl and pl.shipment_no
@@ -1691,14 +2132,74 @@ def process_shipment(docs: dict[str, list[Path]], db: PartsDB,
     return len(res.problems), msg
 
 
+DOC_KINDS = ("invoices", "packing", "reception", "transport", "partsdb", "unknown")
+
+
 def collect(folder: Path) -> dict[str, list[Path]]:
-    docs: dict[str, list[Path]] = {"invoices": [], "packing": [], "reception": [],
-                                   "partsdb": [], "unknown": []}
-    for p in sorted(folder.iterdir()):
-        if p.is_dir() or p.name.startswith("~$"):
+    """Sort a shipment folder's files by what they are.
+
+    Byte-identical copies are dropped first: these arrive as email attachments
+    and the same document routinely appears twice, once as 'X.pdf' and once as
+    'X (1).pdf'. Two copies of one invoice would otherwise double every figure.
+    """
+    docs: dict[str, list[Path]] = {k: [] for k in DOC_KINDS}
+    seen: dict[str, Path] = {}
+    for p in sorted(folder.rglob("*")):
+        if p.is_dir() or p.name.startswith("~$") or p.suffix.lower() == ".zip":
             continue
+        try:
+            digest = hashlib.md5(p.read_bytes()).hexdigest()
+        except Exception:
+            continue
+        if digest in seen:
+            continue
+        seen[digest] = p
         docs[classify(p)].append(p)
     return docs
+
+
+def expand_zips(in_dir: Path) -> list[Path]:
+    """Extract any .zip dropped in the input folder, one folder per zip.
+
+    Shipment paperwork arrives from the carrier as a single zip, so accepting
+    them directly saves unpacking every one by hand. Files that were already
+    extracted keep working exactly as before -- both forms are supported.
+    """
+    made: list[Path] = []
+    seen: dict[str, Path] = {}
+    for z in sorted(in_dir.glob("*.zip")):
+        target = in_dir / f"_{z.stem}"
+        try:
+            # The same shipment's zip often arrives twice ('X.zip' and
+            # 'X (1).zip'). Compare the CONTENTS, not the archive bytes: a
+            # re-zipped copy holds the same documents but hashes differently.
+            with zipfile.ZipFile(z) as probe:
+                digest = hashlib.md5(
+                    ";".join(sorted(f"{i.file_size}:{i.CRC}" for i in probe.infolist()
+                                    if not i.is_dir())).encode()).hexdigest()
+            if digest in seen:
+                print(f"  [ZIP] {z.name} holds the same documents as "
+                      f"{seen[digest].name} -- skipped")
+                continue
+            seen[digest] = z
+            if not target.exists():
+                target.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(z) as zf:
+                    for member in zf.infolist():
+                        if member.is_dir():
+                            continue
+                        # Flatten and sanitize: never let an archive path escape
+                        # the folder we are extracting into.
+                        name = Path(member.filename).name
+                        if not name:
+                            continue
+                        with zf.open(member) as src, open(target / name, "wb") as dst:
+                            dst.write(src.read())
+                print(f"  [ZIP] {z.name} -> {target.name}\\")
+            made.append(target)
+        except Exception as e:
+            print(f"  [WARN] could not open {z.name}: {e}")
+    return made
 
 
 def run(in_dir: Path, out_dir: Path, db_dir: Path) -> int:
@@ -1719,7 +2220,10 @@ def run(in_dir: Path, out_dir: Path, db_dir: Path) -> int:
         return 1
     print(f"Parts database: {db.path.name}  ({len(db.by_key):,} part numbers)")
 
-    # A shipment is either the input folder itself or one subfolder per shipment.
+    # Carrier paperwork usually arrives as one zip per shipment; unpack those
+    # first. A shipment is then either the input folder itself, or one subfolder
+    # per shipment (extracted here or put there by hand).
+    expand_zips(in_dir)
     subfolders = [p for p in sorted(in_dir.iterdir()) if p.is_dir()]
     shipments = subfolders or [in_dir]
 
@@ -1734,9 +2238,9 @@ def run(in_dir: Path, out_dir: Path, db_dir: Path) -> int:
                 return 0
             # Say what WAS recognized, so it is obvious whether the other
             # documents were understood and only the invoices are missing.
-            seen = [f"{len(docs[k])} {k}" for k in ("packing", "reception", "unknown")
-                    if docs[k]]
-            print(f"\n[SKIP] {label}: no commercial invoice PDF found"
+            seen = [f"{len(docs[k])} {k}" for k in ("packing", "reception", "transport",
+                                                    "unknown") if docs[k]]
+            print(f"\n[SKIP] {label}: no commercial invoice found"
                   + (f" (found {', '.join(seen)})" if seen else ""))
             problems += 1
             continue
@@ -1745,6 +2249,8 @@ def run(in_dir: Path, out_dir: Path, db_dir: Path) -> int:
         for kind in ("invoices", "packing", "reception"):
             for p in docs[kind]:
                 print(f"  [{kind.upper():9}] {p.name}")
+        for p in docs["transport"]:
+            print(f"  [TRANSPORT] {p.name}  (not needed for this file)")
         for p in docs["partsdb"]:
             print(f"  [PARTSDB  ] {p.name}  (ignored here -- the database\\ copy is used)")
         for p in docs["unknown"]:

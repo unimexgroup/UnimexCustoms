@@ -20,10 +20,29 @@ Documents are identified by **content**, never by filename (`classify()`), becau
 
 | Document | Required | Supplies | Recognized by |
 |---|---|---|---|
-| Commercial invoices (PDF) | **Yes** | part, qty, unit price, extended value, PO, country of origin, invoice HS | pages containing "Invoice" and "P.O. No." |
-| Packing list (`.xls`/`.xlsx`/PDF) | Strongly wanted | gross/net weight per HS group, cartons, shipment number | Excel: a header row with Purchase Order + Material + Qty. PDF: the text "PACKING LIST" plus a readable table |
+| Commercial invoices (PDF **or** Excel) | **Yes** | part, qty, unit price, extended value, PO, country of origin, invoice HS | PDF: "Invoice" + "P.O. No.", or a table with qty/amount columns. Excel: a sheet with PO, part, qty, amount **and a unit price** |
+| Packing list (`.xls`/`.xlsx`/PDF) | Strongly wanted | gross/net weight, cartons, shipment number | Excel: PO + part + qty **and** weights or cartons, but no unit price. PDF: "PACKING LIST" (or "PACKING/WEIGHT LIST") plus a readable table |
 | Warehouse reception report (PDF) | Optional | independent part/qty check, Mexican fracción | "REPORTE DE RECEPCION" / "RECONOCIMIENTO PREVIO" |
+| Transport paperwork | Ignored | nothing | bills of lading, waybills, FCRs, arrival notices, and any `.docx`/image/email file |
 | Parts database (`.xlsx`) | **Yes** | `Product Key` → `HTS` | lives in `database\`, not `input\` |
+
+A single workbook is frequently **both** invoice and packing list, one sheet
+each. The discriminator is the unit price: only an invoice has one. Getting this
+wrong in either direction is costly — an invoice sheet read as a packing list
+silently suppresses the "no packing list" warning, and an invoice sheet with a
+cartons column read as a *second* packing sheet double-counts every weight.
+
+### Input forms
+
+Shipment paperwork arrives from the carrier as one zip. Dropping that zip
+straight into `input\` works: it is extracted to its own folder and processed as
+one shipment, with archive paths flattened and sanitized so no member can write
+outside it. Already-extracted files and hand-made subfolders behave exactly as
+before.
+
+Byte-identical duplicates are dropped before anything is read. These documents
+arrive as email attachments and the same file routinely appears twice, once as
+`X.pdf` and once as `X (1).pdf`; without this every figure would double.
 
 Without a packing list the file still writes, with weights and cartons blank and a loud warning — the tool does not block on it.
 
@@ -58,17 +77,36 @@ Every non-exact match is printed as a `[NOTE]` line so the resolution path is au
 
 1. **Parse invoices.** One page is normally one invoice; multiple line items per page are handled. Pages titled "Invoice Summary" are roll-ups, kept aside for reconciliation.
 2. **Parse the packing list.** A non-blank gross weight starts a new HS weight group; the weight is stated once per group and carried down. Cartons and volume are shipment-wide, not per line.
-3. **Join** invoice lines to packing rows on `(PO, part, qty)`, one to one, consuming each row at most once.
+3. **Reconcile** the invoice against the packing list **per (PO, part)**, not per line.
 4. **Allocate weight inside each HS group** across only the parts in that group, in proportion to piece count, using largest-remainder rounding in integer hundredths.
 5. **Resolve the HTS** for every part.
 6. **Reconcile** (section 6). Nothing is suppressed.
 7. **Write** the workbook.
 
+### Why the join is per (PO, part)
+
+The two documents agree on **what shipped**, not on how it was written down. Real examples from one batch: one supplier splits a single part across four invoice lines but two packing rows; another prints one packing row per pallet, so one invoice line appears fifteen times. A per-line join fails on both, and the failure is expensive — the unmatched rows' weights are simply dropped.
+
+So both sides are totalled per `(PO, part)` and compared there. Weights and cartons are then read from the **packing rows directly**, because the packing list is the document that states what physically shipped and it is free to break a part across any number of rows. The invoice supplies value, country and its own quantity. Where a packing list never repeats the purchase order, matching falls back to the part number alone and says so.
+
+This replaced a per-line join and the pallet-merging pass that existed only to prop it up.
+
 ### Weight allocation
 
 `allocate_largest_remainder()` works in integer hundredths, so each column sums to its group total **exactly** and the file total matches the packing list exactly, with no `530.3199999999999` float artefacts. Leftover cents go to the largest fractional parts, ties broken by the larger quantity, so the result is identical run to run.
 
-A group holding one part is exact. Any other group assumes equal weight per piece — an estimate, and the run log says so and names which groups are which.
+A group holding one part is exact. Any other group assumes equal weight per piece — an estimate, and the run log says so and names which groups are which. Packing lists that state a weight per line produce one group per line, so every figure is exact.
+
+**True-up.** Each group's split is exact within that group, but the group totals are themselves rounded to the cent, so a shipment with fifty single-row groups can land a few cents from the figure printed on the packing list. The residual is pushed onto the heaviest rows — the same largest-remainder principle applied once at the file level. Value gets the same treatment against the invoice total. Both are bounded to a few cents, so a genuine discrepancy is still reported as a `[CHECK]` rather than smeared across the rows.
+
+**Net weight** is left blank where the document states none — several suppliers give gross only. It is never filled from gross, and the run says plainly that the column is empty.
+
+### Header matching
+
+Both the invoice and packing readers find their table by keyword, allowing the header to span up to three rows (`QTY` over `(PCS)`, or an `HS CODE` printed two rows below its neighbours). Two rules matter more than they look:
+
+- The winning column is the one whose header is **closest** to the keyword, not the leftmost containing it. One supplier leaves a stray `PO#` label above an unrelated column; taking that in preference to the real `PO #` header mapped the purchase order onto an empty column and made every join fail.
+- Columns naming a **per-carton** figure (`Pcs/ctn`, `N.W/CTN`, `Vol./ctn`) are excluded before matching, so a per-unit weight is never read as a row total.
 
 ### Packing lists in PDF form
 
