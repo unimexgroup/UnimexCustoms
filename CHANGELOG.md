@@ -3,6 +3,38 @@
 All notable changes to UnimexCustoms. Versions are tagged `customs-vX.Y.Z`;
 the number must match `CUSTOMS_VERSION` in `_version.py` or CI refuses to build.
 
+## v1.3.0 — 2026-08-14
+
+Reads the remaining supplier format from the August batch: a PDF packing list
+whose measures are split into PER and TTL sub-columns. All eight shipments in
+that batch now produce a customs file that ties to its own documents.
+
+### Added
+
+- **PER/TTL packing lists (PDF).** One supplier prints every measure twice --
+  per carton and total -- with a line item spread over three printed lines:
+  description, carton range, then the figures. Values are read from contiguous
+  glyph runs, because the two sub-columns do not merely abut: they physically
+  overlap, so a flat read interleaves them into a number that is wrong but
+  still plausible (`1.9200` + `38.40` extracts as `1.920038.40`, and worse,
+  `204.55` + `1,227.30` extracts as `204.5510,0227.30`).
+- **Reconstruction from PER x CARTONS** where a total is missing from the page
+  entirely. This is the relationship the document is built on, and the result
+  still has to agree with the shipment totals or the whole packing list is
+  refused — on the batch it reproduced 828.90 and 1,227.30 exactly.
+- **Several packing documents per shipment** are merged, as invoices already
+  were. One supplier sends one packing list per invoice.
+- Figures that wrap onto a line of their own are attached to the row they sit
+  nearest, and never overwrite a value that row already has.
+
+### Fixed
+
+- Characters were re-bucketed into lines independently of the words, which
+  could split one visual line and break the glyph runs across it. Each line's
+  runs are now built from the characters of that line's own words.
+- A value narrow enough to reach neither the PER nor the TTL label (a two-digit
+  quantity under a right-aligned heading) was dropped rather than assigned.
+
 ## v1.2.0 — 2026-08-14
 
 Adds the supplier formats in the August batch: three families that send the

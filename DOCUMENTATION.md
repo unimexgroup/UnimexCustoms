@@ -119,6 +119,16 @@ A PDF has no columns — only ink at coordinates — and every supplier's templa
 
 Columns naming a per-carton figure (`Pcs/ctn`, `N.W/CTN`, `Vol./ctn`) are excluded before the mapping runs, so a per-unit weight is never mistaken for a row total.
 
+### PER/TTL packing lists
+
+One supplier prints every measure twice — per carton and total — under a two-level header (`QUANTITY` / `Net` / `Gross`, each split into `PER` and `TTL`), with a single line item spread over three printed lines: description, carton range, then the figures.
+
+Three things make this layout hostile, and each has a specific answer:
+
+- **The sub-columns overlap.** They do not merely abut: `1.9200` and `38.40` extract as `1.920038.40`, and `204.55` with `1,227.30` extracts as `204.5510,0227.30` — characters from the two values interleaved. This is TRAP 1 again, so the same answer applies: values are read from contiguous glyph runs, which separate the two columns cleanly where no split of the flat string can.
+- **Labels do not sit over their own values.** A group label is centred over its PER/TTL *pair*, and a super-group (`Weight` over `Net` and `Gross`) can sit closer to a leaf than its real parent. So the PER and TTL columns are paired first, and the pair's centre is matched to the nearest label. Matching each leaf on its own picks the wrong owner.
+- **A figure can be missing from the page**, having wrapped onto a line of its own or been swallowed by the overlap. Where a total is absent but its per-carton figure is not, the total is reconstructed as **PER × CARTONS** — the relationship the document is built on. This is not a guess that ships unchecked: the shipment's stated totals still have to agree. On the batch it reproduced 828.90 and 1,227.30 exactly, both confirmed by the document's own totals.
+
 **The validation gate.** A geometric parse can go wrong in ways that still look plausible, so the result is only used if it reproduces every total the document states — from the TOTAL row *and* from any prose restatement (`TOTAL SAYS 262CTNS ,G.W 2648.7KGS`). Anything that does not tie out is **refused**, and the run continues as though no packing list arrived: blank weights, blank cartons, loud warning. Wrong weights in a filing are worse than absent ones.
 
 Both sources are needed, and that is not belt-and-braces. When a column is mis-identified, that column's cell in the TOTAL row is *empty* — so a check that skips missing values would skip the check precisely on the parses that had gone wrong. This bug shipped in v1.0.0's gate and was fixed in v1.1.0; the sabotage test that catches it is described below. When a document states no totals at all, the parse is used but reported as uncorroborated rather than being presented as verified.

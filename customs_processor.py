@@ -961,12 +961,305 @@ def _part_from_text(text: str) -> str:
     return ""
 
 
+# A carton-number RANGE followed by its count: "18 - 18   20" means cartons 18
+# through 18, 20 of them. Printed on its own line above the figures.
+RE_CARTON_RANGE = re.compile(r"^\s*\d+\s*[-–]\s*\d+\s+(\d[\d,]*)\s*$")
+# "1378978-BL 2641608 PO: 1013899576BU" -- part, supplier's own reference, PO.
+RE_PART_THEN_PO = re.compile(r"^\s*(\S+)\s+.*?\bPO\s*[:.]?\s*(\S+)", re.I)
+
+
+def _per_ttl_groups(words: list[dict]) -> dict[str, dict]:
+    """
+    Detect a two-level header where each measure is split into PER and TTL
+    ("QUANTITY" over "PER | TTL", "Net" over "PER | TTL").
+
+    Returns {canonical name: {"per": (x0,x1), "ttl": (x0,x1)}}. Empty when the
+    document has no such header, in which case the caller uses the ordinary
+    single-level reader.
+    """
+    leaves = sorted((w for w in words if w["text"].strip().upper() in {"PER", "TTL"}),
+                    key=lambda w: w["x0"])
+    if len(leaves) < 4:
+        return {}
+    leaf_top = min(w["top"] for w in leaves)
+
+    # Candidate group labels: real words in the header band just above the leaf
+    # row. Parenthesised unit annotations ('(KGS)', '(PCS)') are excluded --
+    # they sit closer to the leaves than the labels that carry the meaning.
+    above = [w for w in words
+             if leaf_top - 60 <= w["bottom"] <= leaf_top + 2
+             and re.search(r"[A-Za-z]", w["text"])
+             and not w["text"].strip().startswith("(")]
+    if not above:
+        return {}
+
+    # Pair each PER with the TTL beside it FIRST, then name the pair from the
+    # label nearest the pair's centre. Matching each leaf on its own picks the
+    # wrong owner: a header may stack 'Weight' over 'Net' and 'Gross', and the
+    # super-group can sit closer to a leaf than its real parent does.
+    pairs: dict[str, dict] = {}
+    used: set[int] = set()
+    for i, leaf in enumerate(leaves):
+        if i in used or i + 1 >= len(leaves):
+            continue
+        nxt = leaves[i + 1]
+        slots = {leaf["text"].strip().lower(), nxt["text"].strip().lower()}
+        if slots != {"per", "ttl"} or nxt["x0"] - leaf["x1"] > 40:
+            continue
+        used.update({i, i + 1})
+        centre = (leaf["x0"] + nxt["x1"]) / 2
+        owner = min(above, key=lambda g: abs((g["x0"] + g["x1"]) / 2 - centre))
+        name = "".join(owner["text"].lower().split())
+        pairs[name] = {leaf["text"].strip().lower(): (leaf["x0"], leaf["x1"]),
+                       nxt["text"].strip().lower(): (nxt["x0"], nxt["x1"])}
+
+    canon: dict[str, dict] = {}
+    for name, slots in pairs.items():
+        if "per" not in slots or "ttl" not in slots:
+            continue
+        if "qty" in name or "quantity" in name or "pcs" in name:
+            key = "qty"
+        elif "net" in name or name.startswith("n.w"):
+            key = "net"
+        elif "gross" in name or name.startswith("g.w"):
+            key = "gross"
+        elif "meas" in name or "cbm" in name or "volume" in name:
+            key = "volume"
+        else:
+            continue
+        canon[key] = slots
+    return canon
+
+
+def _pick_cell(cells: list[dict], box: tuple) -> str:
+    """The cell sitting under a header label, by best horizontal overlap."""
+    best, best_overlap = "", 0.0
+    for c in cells:
+        overlap = min(c["x1"], box[1]) - max(c["x0"], box[0])
+        if overlap > best_overlap:
+            best, best_overlap = c["text"], overlap
+    return best
+
+
+def _read_measure(chains: list[dict], words: list[dict], slots: dict,
+                  cartons: float | None) -> float | None:
+    """
+    Read one measure's TOTAL for a line item.
+
+    Values are taken from contiguous glyph runs, because in this layout the PER
+    and TTL figures do not merely abut -- they physically overlap, and a flat
+    read interleaves them into a number that is wrong but still plausible
+    (TRAP 1). Where the total is missing altogether, it is reconstructed as
+    PER x CARTONS, which is the relationship the document itself is built on.
+    Nothing is invented: the shipment's stated totals still have to agree, or
+    the whole packing list is refused.
+    """
+    ttl = _lead_num(_pick_cell(chains, slots["ttl"]))
+    if ttl is not None:
+        return ttl
+    per = _lead_num(_pick_cell(chains, slots["per"]))
+    if per is None:
+        per = _lead_num(_read_per_ttl_cell(words, **slots)[0])
+    if per is not None and cartons:
+        return round(per * cartons, 2)
+    return None
+
+
+def _read_per_ttl_cell(words: list[dict], per: tuple, ttl: tuple) -> tuple[str, str]:
+    """
+    Read one measure's PER and TTL values off a printed line.
+
+    The two sub-columns are printed hard against each other, so a value pair
+    routinely extracts as a single run: 1.9200 and 38.40 arrive as
+    '1.920038.40'. A word that genuinely overlaps BOTH label ranges is split
+    character by character at the midpoint between them; a word that overlaps
+    only one is taken whole, so a right-shifted '480' under TTL is never
+    chopped into '4' and '80'.
+    """
+    boundary = (per[1] + ttl[0]) / 2
+    span = (per[0] - 6, ttl[1] + 6)
+    out = {"per": [], "ttl": []}
+    for w in words:
+        over_per = min(w["x1"], per[1]) - max(w["x0"], per[0])
+        over_ttl = min(w["x1"], ttl[1]) - max(w["x0"], ttl[0])
+        if over_per >= 3 and over_ttl >= 3:
+            for ch in sorted(w.get("chars", []), key=lambda c: c["x0"]):
+                side = "per" if (ch["x0"] + ch["x1"]) / 2 < boundary else "ttl"
+                out[side].append(ch["text"])
+        elif over_per > 0 or over_ttl > 0:
+            out["per" if over_per >= over_ttl else "ttl"].append(w["text"])
+        elif span[0] <= w["x0"] and w["x1"] <= span[1]:
+            # Inside the measure's span but too narrow to reach either label --
+            # a two-digit value sits well clear of a right-aligned 'TTL'. Decide
+            # by which side of the boundary it falls on.
+            centre = (w["x0"] + w["x1"]) / 2
+            out["per" if centre < boundary else "ttl"].append(w["text"])
+    return "".join(out["per"]).strip(), "".join(out["ttl"]).strip()
+
+
+def _parse_per_ttl_packing(path: Path, pl: PackingList) -> bool:
+    """
+    Read a packing list whose measures are split into PER and TTL columns, and
+    whose line items span several printed lines: description on one, the carton
+    range on another, the figures on a third.
+
+    Returns True when rows were read. The caller still validates the result
+    against the document's stated totals before using any of it.
+    """
+    import pdfplumber
+
+    groups: dict[str, dict] = {}
+    ctn_label: tuple | None = None
+    rows_found = False
+    stated: dict[str, list[float]] = {"qty": [], "gross": [], "net": [], "cartons": []}
+
+    with pdfplumber.open(str(path)) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words(extra_attrs=["fontname"])
+            for w in words:                       # attach chars for splitting
+                w["chars"] = [c for c in page.chars
+                              if w["x0"] - 0.1 <= c["x0"] and c["x1"] <= w["x1"] + 0.1
+                              and abs(c["top"] - w["top"]) < 2]
+            found = _per_ttl_groups(words)
+            if found:
+                groups = found
+                hit = next((w for w in words
+                            if w["text"].strip().upper().startswith("CTN")), None)
+                if hit:
+                    ctn_label = (hit["x0"], hit["x1"])
+            if not groups or "qty" not in groups:
+                continue
+
+            lines = _cluster_lines(words)
+            pending_cartons: float | None = None
+            page_rows: list[tuple[float, PackingRow]] = []
+            orphans: list[tuple[float, list[dict], list[dict]]] = []
+            for line in lines:
+                text = " ".join(w["text"] for w in line)
+                # Chain the characters of THIS line's words: re-bucketing the
+                # page's characters independently can split one visual line.
+                chains = _glyph_chains([c for w in line for c in w["chars"]])
+
+                m = RE_CARTON_RANGE.match(text)
+                if m:
+                    pending_cartons = _num(m.group(1))
+                    continue
+
+                qty_per, qty_ttl = _read_per_ttl_cell(line, **groups["qty"])
+                is_total = bool(re.match(r"\s*total", text, re.I))
+                if is_total:
+                    for key in ("qty", "net", "gross"):
+                        if key in groups:
+                            v = _lead_num(_pick_cell(chains, groups[key]["ttl"]))                                 or _lead_num(_read_per_ttl_cell(line, **groups[key])[1])
+                            if v is not None:
+                                stated[key].append(v)
+                    if ctn_label:
+                        for w in line:
+                            if (min(w["x1"], ctn_label[1]) - max(w["x0"], ctn_label[0])) > 0:
+                                v = _lead_num(w["text"])
+                                if v is not None:
+                                    stated["cartons"].append(v)
+                    continue
+
+                pm = RE_PART_THEN_PO.match(text)
+                if not pm or _lead_num(qty_ttl) is None:
+                    # A figure can wrap onto a line of its own, leaving its row
+                    # a weight short. Keep it to attach afterwards.
+                    if any(_read_measure(chains, line, g, None) is not None
+                           for g in groups.values()):
+                        orphans.append((line[0]["top"], line, chains))
+                    continue
+
+                group_id = len(pl.group_gross)
+                row = PackingRow(
+                    po=_norm_key(pm.group(2)), part=_norm_key(pm.group(1)),
+                    qty=_lead_num(qty_ttl), hs="", group=group_id,
+                    cartons=pending_cartons,
+                )
+                pl.group_gross[group_id] = (_read_measure(chains, line, groups["gross"],
+                                                          row.cartons)
+                                            if "gross" in groups else None)
+                pl.group_net[group_id] = (_read_measure(chains, line, groups["net"],
+                                                        row.cartons)
+                                          if "net" in groups else None)
+                pl.rows.append(row)
+                page_rows.append((line[0]["top"], row))
+                pending_cartons = None
+                rows_found = True
+
+            # Attach each stray figure to the row it sits nearest, and only
+            # where that row is missing that measure -- never overwriting one.
+            for top, line, orphan_chains in orphans:
+                if not page_rows:
+                    continue
+                _, row = min(page_rows, key=lambda pr: abs(pr[0] - top))
+                for key, store in (("gross", pl.group_gross), ("net", pl.group_net)):
+                    if key not in groups or store.get(row.group) is not None:
+                        continue
+                    v = _read_measure(orphan_chains, line, groups[key], row.cartons)
+                    if v is not None:
+                        store[row.group] = v
+
+    for gid, v in list(pl.group_gross.items()):
+        if v is None:
+            pl.group_gross[gid] = 0.0
+
+    if not rows_found:
+        return False
+
+    # A figure that wrapped onto its own line leaves a row short; the document's
+    # totals are what catch it, so nothing is patched up silently here.
+    pl.total_qty = stated["qty"][0] if stated["qty"] else None
+    pl.total_gross = stated["gross"][0] if stated["gross"] else None
+    pl.total_net = stated["net"][0] if stated["net"] else None
+    if stated["cartons"]:
+        pl.cartons = stated["cartons"][0]
+        pl.carton_source = "the packing list's stated total"
+    return True
+
+
+def _validate_packing(pl: PackingList, path: Path) -> None:
+    """Refuse a parse that does not reproduce the totals the document states.
+    A missing total is not a pass -- it is simply nothing to check against, and
+    the caller is told so rather than being left to assume the figures were
+    verified."""
+    def check(label: str, ours: float, stated: float | None, tol: float) -> None:
+        if stated is None:
+            return
+        if abs(ours - stated) > tol:
+            raise RuntimeError(
+                f"{path.name}: parsed {label} {ours:,.2f} does not match the "
+                f"{stated:,.2f} stated on the document -- refusing this packing list "
+                f"rather than filing figures that may be wrong")
+
+    check("quantity", sum(r.qty for r in pl.rows), pl.total_qty, 0.5)
+    check("gross weight", sum(pl.group_gross.values()), pl.total_gross, 0.05)
+    check("net weight", sum(v for v in pl.group_net.values() if v is not None),
+          pl.total_net, 0.05)
+    row_cartons = [r.cartons for r in pl.rows if r.cartons is not None]
+    if len(row_cartons) == len(pl.rows) and row_cartons:
+        check("carton count", sum(row_cartons), pl.cartons, 0.5)
+        pl.cartons = sum(row_cartons)
+        pl.carton_source = "per-row carton counts"
+    for name, label in (("total_gross", "gross weight"), ("total_net", "net weight")):
+        if getattr(pl, name) is None:
+            pl.notes.append(f"the packing list states no total {label}, so the figures "
+                            f"read from it could not be corroborated against the document")
+
+
 def parse_packing_list_pdf(path: Path) -> PackingList:
     """Read a packing list that arrived as a PDF. Raises if it cannot be
     parsed and validated -- never returns a half-read table."""
     import pdfplumber
 
     pl = PackingList(path=path)
+
+    # A two-level PER/TTL header needs its own reader: the sub-columns print
+    # hard against each other and a line item spans several printed lines.
+    if _parse_per_ttl_packing(path, pl):
+        _validate_packing(pl, path)
+        return pl
+
     header_cols: list[dict] = []
     cols_map: dict[str, int] = {}
     totals_line: dict[int, str] = {}
@@ -1255,7 +1548,7 @@ class ReceptionReport:
     guide: str = ""
 
 
-def _glyph_chains(chars: list[dict], tol: float = 0.6) -> list[tuple[str, float]]:
+def _glyph_chains(chars: list[dict], tol: float = 0.6) -> list[dict]:
     """
     Rebuild one printed row's cells by following CONTIGUOUS GLYPH RUNS.
 
@@ -1271,7 +1564,7 @@ def _glyph_chains(chars: list[dict], tol: float = 0.6) -> list[tuple[str, float]
     STARTS separates the two columns cleanly, because a character of the tariff
     column continues the tariff column's chain, not the PO's.
 
-    Returns [(text, x0)] in left-to-right order of each chain's start.
+    Returns [{text, x0, x1}] in left-to-right order of each chain's start.
     """
     if not chars:
         return []
@@ -1308,7 +1601,8 @@ def _glyph_chains(chars: list[dict], tol: float = 0.6) -> list[tuple[str, float]
                     extended = True
         chains.append(chain)
     chains.sort(key=lambda ch: ch[0]["x0"])
-    return [("".join(c["text"] for c in ch).strip(), ch[0]["x0"]) for ch in chains]
+    return [{"text": "".join(c["text"] for c in ch).strip(),
+             "x0": ch[0]["x0"], "x1": max(c["x1"] for c in ch)} for ch in chains]
 
 
 def _reception_rows_by_glyph(path: Path) -> list[ReceptionRow]:
@@ -1322,8 +1616,7 @@ def _reception_rows_by_glyph(path: Path) -> list[ReceptionRow]:
             for ch in page.chars:
                 by_line.setdefault(round(ch["top"], 0), []).append(ch)
             for top in sorted(by_line):
-                cells = _glyph_chains(by_line[top])
-                texts = [t for t, _ in cells]
+                texts = [c["text"] for c in _glyph_chains(by_line[top])]
                 marker = next((i for i, t in enumerate(texts) if "(L/E)" in t), None)
                 if marker is None:
                     continue
@@ -2044,6 +2337,28 @@ def read_invoices(paths: list[Path]) -> InvoiceDoc:
     return merged
 
 
+def merge_packing_lists(parts: list[PackingList]) -> PackingList:
+    """Combine one shipment's packing documents into one. Suppliers send one
+    packing list per invoice, and the customs file covers the whole shipment."""
+    merged = PackingList(path=parts[0].path)
+    for pl in parts:
+        offset = len(merged.group_gross)
+        for gid, gross in pl.group_gross.items():
+            merged.group_gross[gid + offset] = gross
+            merged.group_net[gid + offset] = pl.group_net.get(gid)
+        for row in pl.rows:
+            row.group += offset
+            merged.rows.append(row)
+        for name in ("total_qty", "total_gross", "total_net", "cartons"):
+            mine, theirs = getattr(merged, name), getattr(pl, name)
+            if theirs is not None:
+                setattr(merged, name, (mine or 0.0) + theirs)
+        merged.carton_source = pl.carton_source or merged.carton_source
+        merged.shipment_no = merged.shipment_no or pl.shipment_no
+        merged.notes.extend(pl.notes)
+    return merged
+
+
 def read_packing_list(path: Path, res: ShipmentResult) -> PackingList | None:
     """Read a packing list in whichever form it arrived. A PDF that cannot be
     parsed and validated is reported and dropped, not half-used: the run then
@@ -2071,10 +2386,10 @@ def process_shipment(docs: dict[str, list[Path]], db: PartsDB,
         raise RuntimeError("no invoice line items could be parsed")
 
     pl = None
-    for candidate in docs["packing"]:
-        pl = read_packing_list(candidate, res)
-        if pl is not None:
-            break
+    usable = [p for p in (read_packing_list(c, res) for c in docs["packing"])
+              if p is not None]
+    if usable:
+        pl = merge_packing_lists(usable)
     if pl is None:
         # No packing list of its own. A combined invoice+packing document
         # carries the table inside the invoice file -- a workbook with one sheet

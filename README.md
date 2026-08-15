@@ -3,7 +3,7 @@
 A standalone Windows tool that turns one inbound shipment's paperwork into the customs team's Excel file: **one row per part number**, aggregated across every invoice in the shipment, with the **US HTS code** pulled from the Kohler parts database.
 
 **Department:** US Customs Brokerage
-**Current version:** v1.2.0
+**Current version:** v1.3.0
 
 Replaces the hand-run `customs-summary-prompt.txt` workflow. Same output, same checks, no prompting.
 
