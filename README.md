@@ -3,7 +3,7 @@
 A standalone Windows tool that turns one inbound shipment's paperwork into the customs team's Excel file: **one row per part number**, aggregated across every invoice in the shipment, with the **US HTS code** pulled from the Kohler parts database.
 
 **Department:** US Customs Brokerage
-**Current version:** v1.4.0
+**Current version:** v1.5.0
 
 Replaces the hand-run `customs-summary-prompt.txt` workflow. Same output, same checks, no prompting.
 
@@ -41,7 +41,8 @@ Sorted by value descending, with a bold TOTAL row using live `=SUM()` formulas. 
 Two things worth knowing before filing:
 
 - **Cartons.** Most shipping paperwork states a shipment total only, never a per-part count. In that case the whole total sits on the **first row** so the column still ties out; it is not an allocation and the other rows are blank by design. When a packing list *does* state a count per line, those real per-part counts are used instead. The run log says which rule applied.
-- **Per-row weights are allocated**, not measured, *when* the packing list states weight once per HS group: each group is split across its parts in proportion to piece count. Column totals are exact; a group holding a single part is exact; everything else assumes equal weight per piece. The run log names which groups came out which way. Packing lists that state a weight per line give exact figures throughout.
+- **Per-row weights are allocated**, not measured, *when* the packing list states weight once per group of rows: each group is split across its parts by carton count where the packing list states cartons per row, and by piece count where it does not. Column totals are exact; a group holding a single part is exact; everything else is an estimate. The run log names which groups came out which way and which basis each split used. Packing lists that state a weight per line give exact figures throughout.
+- **A token weight counts as blank.** One supplier types `0.01` in the weight cell of every row that shares the weight stated above it, where the others leave it empty. Both mean the same thing and are read the same way, so those rows no longer reach the file carrying ten grams. The run log says how many rows did this.
 - **Net weight can be blank.** Some suppliers state gross only. Nothing is invented in its place; the run log says so plainly.
 
 ## Reconciliation

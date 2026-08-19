@@ -89,9 +89,9 @@ Every non-exact match is printed as a `[NOTE]` line so the resolution path is au
 ## 4. Processing pipeline
 
 1. **Parse invoices.** One page is normally one invoice; multiple line items per page are handled. Pages titled "Invoice Summary" are roll-ups, kept aside for reconciliation.
-2. **Parse the packing list.** A non-blank gross weight starts a new HS weight group; the weight is stated once per group and carried down. Cartons and volume are shipment-wide, not per line.
+2. **Parse the packing list.** A non-blank gross weight starts a new weight group; the weight is stated once per group and carried down. A *token* weight — a gram or less per piece, and a kilo or less on the whole line — is a placeholder for a blank cell, not a measurement, and carries down the same way. Cartons and volume are shipment-wide, not per line.
 3. **Reconcile** the invoice against the packing list **per (PO, part)**, not per line.
-4. **Allocate weight inside each HS group** across only the parts in that group, in proportion to piece count, using largest-remainder rounding in integer hundredths.
+4. **Allocate weight inside each weight group** across only the parts in that group — by carton count where the packing list states cartons per row, by piece count where it does not — using largest-remainder rounding in integer hundredths.
 5. **Resolve the HTS** for every part.
 6. **Reconcile** (section 6). Nothing is suppressed.
 7. **Write** the workbook.
@@ -108,7 +108,11 @@ This replaced a per-line join and the pallet-merging pass that existed only to p
 
 `allocate_largest_remainder()` works in integer hundredths, so each column sums to its group total **exactly** and the file total matches the packing list exactly, with no `530.3199999999999` float artefacts. Leftover cents go to the largest fractional parts, ties broken by the larger quantity, so the result is identical run to run.
 
-A group holding one part is exact. Any other group assumes equal weight per piece — an estimate, and the run log says so and names which groups are which. Packing lists that state a weight per line produce one group per line, so every figure is exact.
+A group holding one part is exact. Any other group is an estimate, and the run log says so and names which groups are which, and which basis each split used. Packing lists that state a weight per line produce one group per line, so every figure is exact.
+
+**Cartons before pieces.** A group split by piece count assumes every piece in it weighs the same, which is false the moment a group mixes sizes: one pallet holds 100 tub/shower assemblies (100 cartons) beside 1,000 hose assemblies (20 cartons), and by piece count the assemblies take a tenth of the weight of the hoses — off by ten times, in the direction of understating the heavy part. A carton is packed to a working weight whatever is inside it, so where the packing list states cartons per row they are the better proxy and are used instead. Piece count remains the fallback, and is still what the Kohler Nanchang template gets, since it states cartons for the shipment only.
+
+**A token weight is a blank cell.** Most templates leave the weight cell empty on a row that shares the row above's figure. Runner's types `0.01` there instead. Read literally that is the line's weight, which put 0.01 kg against 26,000 stem adapters and 0.01 kg against 1,000 hose assemblies in the customs file — and *nothing was flagged*, because the packing list's own total row is a `=SUM()` over the column the token sits in, so every weight check tied out to the gram. Two thresholds separate a placeholder from a measurement without guessing: a real line total is never a kilo or less **and** never under a gram per piece. Across the three older suppliers the lightest real figure is 1.97 kg at 0.123 kg/piece, and the lightest real per-piece figure is 0.020 kg — 20× clear of the threshold — while Runner's tokens sit at 1e-4 kg/piece or below. A token is added to the group it rides on rather than dropped, so the column still ties to the packing list's printed total exactly. The count of such rows is reported.
 
 **True-up.** Each group's split is exact within that group, but the group totals are themselves rounded to the cent, so a shipment with fifty single-row groups can land a few cents from the figure printed on the packing list. The residual is pushed onto the heaviest rows — the same largest-remainder principle applied once at the file level. Value gets the same treatment against the invoice total. Both are bounded to a few cents, so a genuine discrepancy is still reported as a `[CHECK]` rather than smeared across the rows.
 
@@ -170,7 +174,9 @@ whose first ten characters are `7419809991` — wrong, but still shaped like a v
 
 **Hand-keyed part numbers contain typos.** Real examples from this shipment: `129929-U-BL` (a digit short of `1299295-U-BL`) and `1332370-U-2-MB` (an extra hyphen). Unknown parts are matched punctuation-blind, then at edit distance 1, and accepted **only when exactly one candidate fits**. Every rewrite is printed.
 
-**Weight must be allocated per HS group, never globally.** A global split once gave a part 1,148.60 kg against an actual 66.00 kg — 17× over — because it was a tiny copper nut shipped alongside heavy assemblies.
+**Weight must be allocated per weight group, never globally.** A global split once gave a part 1,148.60 kg against an actual 66.00 kg — 17× over — because it was a tiny copper nut shipped alongside heavy assemblies.
+
+**A filled-in cell is not automatically a figure.** Every weight rule here keys off "non-blank", which quietly assumes a supplier leaves a cell empty when it has nothing to say. One does not. The check that should have caught it compared the column against the document's own total, and that total was a `=SUM()` of the same column — a document is not evidence about itself. What made this visible was per-piece plausibility, not a total.
 
 **PDF backends are not interchangeable.** pdfplumber is tried first, pypdf second, and whichever actually yields text wins. A coordinate-capable backend is required for the glyph-chain work; without one the reception report's overlapping rows are **dropped rather than recorded with a mangled code**.
 

@@ -592,7 +592,32 @@ class PackingList:
     cartons: float | None = None
     carton_source: str = ""
     shipment_no: str = ""
+    filler_weight_rows: int = 0
     notes: list[str] = field(default_factory=list)
+
+
+# A row that shares the weight stated above it is usually left blank. One
+# supplier types a token figure instead, and taken at face value that figure
+# becomes the line's weight: 0.01 kg for 26,000 stem adapters. A real line
+# total is never this light AND never under a gram per piece, so the pair of
+# thresholds tells a placeholder from a measurement without guessing.
+PL_FILLER_WEIGHT_MAX = 1.0        # kg, whole line
+PL_FILLER_WEIGHT_PER_PC = 0.001   # kg per piece
+
+
+def _is_filler_weight(weight: float | None, qty: float | None) -> bool:
+    """True when a stated weight is a placeholder rather than a measurement.
+
+    Runner's packing list writes 0.01 in the weight and volume cells of every
+    row that rides on the row above's stated figure, where the other suppliers
+    leave them empty. Both habits mean the same thing and both have to read the
+    same way: otherwise one stated pallet weight is split into one group per
+    row, and every row but the first walks into the customs file carrying ten
+    grams while the column total still ties out and nothing looks wrong.
+    """
+    if weight is None or qty is None or qty <= 0:
+        return False
+    return 0 <= weight <= PL_FILLER_WEIGHT_MAX and weight / qty < PL_FILLER_WEIGHT_PER_PC
 
 
 def _read_sheet(path: Path, sheet) -> pd.DataFrame:
@@ -720,6 +745,13 @@ def parse_packing_list(path: Path) -> PackingList:
             pl.cartons = sum(carton_values)
             pl.carton_source = "sum of the per-row carton column"
 
+    if pl.filler_weight_rows:
+        pl.notes.append(
+            f"{pl.filler_weight_rows} of {len(pl.rows)} packing-list rows state a token "
+            f"weight (a gram or less per piece) where other templates leave the cell "
+            f"blank; each was read as sharing the weight stated above it, so those "
+            f"parts' weights are allocated rather than measured")
+
     # An HS group whose code is not constant means the group boundaries (drawn
     # from where weights are stated) don't line up with the tariff grouping.
     for g in sorted(pl.group_gross):
@@ -800,7 +832,12 @@ def _read_packing_sheet(pl: PackingList, df: pd.DataFrame, hrow: int,
         if qty is None:
             continue
 
-        if gross is not None:
+        # A token weight reads as an empty cell: this row rides on the weight
+        # stated above it and must not open a group of its own.
+        filler = _is_filler_weight(gross, qty)
+        if filler:
+            pl.filler_weight_rows += 1
+        if gross is not None and not filler:
             group += 1
             pl.group_gross[group] = gross
             pl.group_net[group] = net
@@ -808,6 +845,13 @@ def _read_packing_sheet(pl: PackingList, df: pd.DataFrame, hrow: int,
             group = 0
             pl.group_gross.setdefault(group, 0.0)
             pl.group_net.setdefault(group, None)
+        if filler:
+            # Add the token to that group rather than discarding it: the
+            # packing list's own total row sums the column it sits in, so
+            # dropping it would leave every weight check a few grams short.
+            pl.group_gross[group] = pl.group_gross.get(group, 0.0) + (gross or 0.0)
+            if net is not None and pl.group_net.get(group) is not None:
+                pl.group_net[group] = pl.group_net[group] + net
         if ctn is not None:
             carton_values.append(ctn)
 
@@ -1897,12 +1941,19 @@ def build_rows(lines: list[InvoiceLine], pl: PackingList | None,
             p["inv_hs"].add(ln.invoice_hs)
 
 
-    # Piece counts per (weight group, part), straight off the packing list.
+    # Piece and carton counts per (weight group, part), straight off the
+    # packing list. Both are needed: which one splits a group's stated weight
+    # best depends on what the document actually states per row.
     if pl is not None:
         for row in pl.rows:
             part = alias.get(row.part, row.part)
-            gp = per_group.setdefault(row.group, {}).setdefault(part, {"qty": 0.0})
+            gp = per_group.setdefault(row.group, {}).setdefault(
+                part, {"qty": 0.0, "cartons": 0.0, "all_cartons": True})
             gp["qty"] += row.qty
+            if row.cartons is None:
+                gp["all_cartons"] = False
+            else:
+                gp["cartons"] += row.cartons
 
     gross_by_part: dict[str, float] = {}
     net_by_part: dict[str, float] = {}
@@ -1910,18 +1961,34 @@ def build_rows(lines: list[InvoiceLine], pl: PackingList | None,
         for g, parts in sorted(per_group.items()):
             names = list(parts)
             qtys = [parts[n]["qty"] for n in names]
-            gross = allocate_largest_remainder(pl.group_gross.get(g, 0.0), qtys)
+            ctns = [parts[n]["cartons"] for n in names]
+            # Split by CARTONS when the packing list states one per row, and
+            # fall back to piece count when it does not. A group holding a tub
+            # shower assembly beside a bag of hoses has to be split by
+            # something that tracks weight, and a carton does: it is packed to
+            # a working weight whatever is inside it, where a piece is not --
+            # by piece count those 100 assemblies take a tenth of the weight of
+            # the 1,000 hoses sharing their pallet, which is off by ten times.
+            by_cartons = (all(parts[n]["all_cartons"] for n in names)
+                          and all(c > 0 for c in ctns))
+            basis = ctns if by_cartons else qtys
+            gross = allocate_largest_remainder(pl.group_gross.get(g, 0.0), basis)
             for n, gv in zip(names, gross):
                 gross_by_part[n] = round(gross_by_part.get(n, 0.0) + gv, 2)
             # A document that states no net weight leaves the column blank
             # rather than repeating gross or writing a zero it cannot support.
             group_net_total = pl.group_net.get(g)
             if group_net_total is not None:
-                for n, nv in zip(names, allocate_largest_remainder(group_net_total, qtys)):
+                for n, nv in zip(names, allocate_largest_remainder(group_net_total, basis)):
                     net_by_part[n] = round(net_by_part.get(n, 0.0) + nv, 2)
             label = (f"group {g + 1} ({pl.group_gross.get(g, 0.0):,.2f} kg gross, "
                      f"{len(names)} part(s))")
-            (res.exact_groups if len(names) == 1 else res.estimated_groups).append(label)
+            if len(names) == 1:
+                res.exact_groups.append(label)
+            else:
+                res.estimated_groups.append(
+                    label + (", split by cartons" if by_cartons else
+                             ", split by piece count"))
 
     # True-up. Each group's split is exact within that group, but the group
     # totals are themselves rounded to the cent, so a shipment with fifty
@@ -2353,6 +2420,7 @@ def merge_packing_lists(parts: list[PackingList]) -> PackingList:
             mine, theirs = getattr(merged, name), getattr(pl, name)
             if theirs is not None:
                 setattr(merged, name, (mine or 0.0) + theirs)
+        merged.filler_weight_rows += pl.filler_weight_rows
         merged.carton_source = pl.carton_source or merged.carton_source
         merged.shipment_no = merged.shipment_no or pl.shipment_no
         merged.notes.extend(pl.notes)
@@ -2436,9 +2504,11 @@ def process_shipment(docs: dict[str, list[Path]], db: PartsDB,
         print(f"  [CHECK] {p}")
     if res.estimated_groups or res.exact_groups:
         print()
-        print("  Per-row weights are ALLOCATED within each HS group in proportion to")
-        print("  piece count; column totals are exact, individual rows assume equal")
-        print("  weight per piece.")
+        print("  Per-row weights are ALLOCATED within each weight group, by carton")
+        print("  count where the packing list states cartons per row and by piece")
+        print("  count where it does not; column totals are exact, individual rows")
+        print("  assume the group's weight is spread evenly across whichever of the")
+        print("  two the split used.")
         for g in res.exact_groups:
             print(f"    exact (single part)  : {g}")
         for g in res.estimated_groups:

@@ -3,6 +3,60 @@
 All notable changes to UnimexCustoms. Versions are tagged `customs-vX.Y.Z`;
 the number must match `CUSTOMS_VERSION` in `_version.py` or CI refuses to build.
 
+## v1.5.0 — 2026-08-19
+
+Reads Runner (Xiamen)'s combined invoice + packing-list workbook, the first
+template that writes a **token weight instead of leaving the cell blank**. The
+customs team reported that weight "wasn't being picked up" for shipment
+`KBU07052026468` / invoices `IV00075087`-`88`, and it was not: 11 of 25 parts
+reached the file carrying between 0.01 and 0.10 kg, including 26,000 stem
+adapters at 0.10 kg and 1,000 hose assemblies at 0.01 kg.
+
+### Fixed
+
+- **A token weight is now read as the blank cell it stands in for.** Every
+  weight rule keyed off "a non-blank gross weight starts a new group", which
+  assumed a supplier leaves the cell empty on a row that shares the weight
+  stated above it. Runner types `0.01` there. So all 53 rows opened a group of
+  their own, each holding a hundredth of a kilo, and the 22 real pallet weights
+  were split off from the rows they cover. A figure that is a kilo or less on
+  the whole line **and** under a gram per piece is a placeholder, not a
+  measurement; it carries down like a blank, and is added to the group it rides
+  on so the column still ties to the packing list's printed total exactly.
+  Across the three older suppliers the lightest real figure is 1.97 kg at
+  0.123 kg/piece and the lightest real per-piece figure is 0.020 kg, 20× clear
+  of the threshold — none of them trips it, and their output is byte-identical.
+- **Nothing was flagged.** Not one `[CHECK]` fired on a file declaring ten
+  grams for 26,000 pieces, because the only figure the weights were checked
+  against was the packing list's own total row — a `=SUM()` over the column the
+  tokens sit in. A document is not evidence about itself. The run now reports
+  how many rows stated a token weight and that those parts' weights are
+  allocated rather than measured.
+
+### Changed
+
+- **A group's weight is split by cartons, not pieces, where the packing list
+  states cartons per row.** Piece count assumes every piece in a group weighs
+  the same, which breaks as soon as a group mixes sizes: one of Runner's
+  pallets holds 100 tub/shower assemblies (100 cartons) beside 1,000 hose
+  assemblies (20 cartons), and by piece count the assemblies take a tenth of
+  the weight of the hoses — 0.31 kg each against a real 2.8 kg. A carton is
+  packed to a working weight whatever is inside it. Piece count stays the
+  fallback, so the Kohler Nanchang template — which states cartons for the
+  shipment only — is unaffected; both older shipments produce byte-identical
+  files, verified.
+
+### Known limitation
+
+- Runner states each pallet's weight on **one** row of that pallet and `0.01`
+  on the rest, and the file does not say reliably which row. Read as
+  carry-down — the convention every other supplier here follows, and the only
+  reading under which no row is left unweighed — some groups still imply a
+  per-piece weight that disagrees with the same part elsewhere in the file by
+  around 2×. Every part now lands in a plausible range and the column total is
+  exact, but the per-part split inside a shared pallet is an estimate, as the
+  log says. A packing list stating weight per line would remove the guess.
+
 ## v1.4.0 — 2026-08-19
 
 Corrects what the log says about a folder holding several invoices. The merging
