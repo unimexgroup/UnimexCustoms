@@ -3,7 +3,7 @@
 A standalone Windows tool that turns one inbound shipment's paperwork into the customs team's Excel file: **one row per part number**, aggregated across every invoice in the shipment, with the **US HTS code** pulled from the Kohler parts database.
 
 **Department:** US Customs Brokerage
-**Current version:** v1.3.0
+**Current version:** v1.4.0
 
 Replaces the hand-run `customs-summary-prompt.txt` workflow. Same output, same checks, no prompting.
 
@@ -27,7 +27,7 @@ Publishing a new version is automated: push a `customs-vX.Y.Z` tag and GitHub Ac
    - waybills, FCRs, container checklists — harmless, they're recognized and skipped
 5. Double-click again. `output\customs_summary_<shipment>.xlsx` appears.
 
-Processing several shipments at once: drop in one zip per shipment, or give each one its own subfolder under `input\`. Duplicate copies of the same document (`X.pdf` and `X (1).pdf`) are detected and counted once.
+**Everything in one folder is one shipment.** Several invoices, several packing lists — all of them are read and merged into the one file, which is how the customs team builds it by hand: every invoice in the container on one sheet, totalled together. To keep two shipments apart, give each its own subfolder under `input\`, or drop one zip per shipment. Duplicate copies of the same document (`X.pdf` and `X (1).pdf`) are detected and counted once.
 
 Documents are identified by their **contents**, not their filenames — the team can drop them in exactly as received.
 

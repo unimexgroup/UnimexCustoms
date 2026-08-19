@@ -3,6 +3,33 @@
 All notable changes to UnimexCustoms. Versions are tagged `customs-vX.Y.Z`;
 the number must match `CUSTOMS_VERSION` in `_version.py` or CI refuses to build.
 
+## v1.4.0 — 2026-08-19
+
+Corrects what the log says about a folder holding several invoices. The merging
+itself is right and stays: verified against the customs team's hand-built file
+for shipment `um260545`, which puts invoices 202604441 and 202604923 on **one
+sheet** with a subtotal per invoice and a grand total across both — the same
+figures this tool already produced ($36,559.93 + $23,158.80 = $59,718.73,
+cartons 413 + 7 = 420, gross 1,975.20 + 1,363.67 = 3,338.87 kg).
+
+### Fixed
+
+- **The multi-document warning described something the tool never did.**
+  `2 invoices documents found; using 202604441.0713A.xlsx` named one file while
+  the run read and merged all of them. Anyone reconciling the output against
+  that one document found figures that could not come from it, and the natural
+  reading — that half the paperwork had been dropped — was wrong. It now says
+  plainly that every one of them is read and merged into the shipment's file.
+- A shipment or guide number containing a slash (`202604441/00199`, exactly how
+  invoices print it) would have sent the output file to a folder that does not
+  exist and failed the shipment. The file **name** is sanitized; nothing inside
+  the file changes.
+
+### Changed
+
+- The reception-report case is a separate `[WARN]`, since only the first one is
+  cross-checked — that one really is "using X".
+
 ## v1.3.0 — 2026-08-14
 
 Reads the remaining supplier format from the August batch: a PDF packing list

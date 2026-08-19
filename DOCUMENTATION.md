@@ -1,6 +1,6 @@
 # UnimexCustoms — Technical Documentation
 
-Version 1.0.0 · US Customs Brokerage
+Version 1.4.0 · US Customs Brokerage
 
 ---
 
@@ -45,6 +45,19 @@ arrive as email attachments and the same file routinely appears twice, once as
 `X.pdf` and once as `X (1).pdf`; without this every figure would double.
 
 Without a packing list the file still writes, with weights and cartons blank and a loud warning — the tool does not block on it.
+
+### A folder is one shipment
+
+Everything in one folder — one zip, one subfolder, or `input\` itself — is read
+as a single shipment: several invoice documents and several packing lists are all
+merged into one file. This matches how the team builds the summary by hand.
+Their file for `um260545` carries invoices 202604441 and 202604923 on one sheet,
+each invoice as its own block with a subtotal, then a grand total across both,
+and the figures are the ones this tool already produced.
+
+Two shipments are kept apart by putting each in its own subfolder, or by
+dropping one zip per shipment. The log states how many documents were merged, so
+a file covering two invoices is never silent about it.
 
 ### The parts database
 

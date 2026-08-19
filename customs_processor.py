@@ -2420,6 +2420,10 @@ def process_shipment(docs: dict[str, list[Path]], db: PartsDB,
 
     shipment = (pl.shipment_no if pl and pl.shipment_no
                 else (rep.guide if rep and rep.guide else label))
+    # Shipment and guide numbers are transcribed verbatim and some carry a slash
+    # ('202604441/00199'), which would send the file to a folder that does not
+    # exist. Only the file name is sanitized; nothing inside the file changes.
+    shipment = re.sub(r"[^A-Za-z0-9._-]+", "_", shipment) or label
     out_path = out_dir / f"customs_summary_{shipment}.xlsx"
     written = write_workbook(rows, res.review, out_path)
 
@@ -2571,11 +2575,19 @@ def run(in_dir: Path, out_dir: Path, db_dir: Path) -> int:
         for p in docs["unknown"]:
             print(f"  [?????????] {p.name}  (not recognized -- check the file)")
             problems += 1
-        for kind in ("invoices", "packing", "reception"):
+        # Say what is actually done with them. The old wording ("using X") named
+        # one document while the run read and merged all of them, which is right
+        # -- the customs file covers the whole shipment, several invoices and
+        # several packing lists included -- but it described a file nobody could
+        # reconcile against the paperwork.
+        for kind in ("invoices", "packing"):
             if len(docs[kind]) > 1:
-                print(f"  [WARN] {len(docs[kind])} {kind} documents found; using "
-                      f"{docs[kind][0].name}. Give each shipment its own subfolder "
-                      f"under input\\ if these belong to different shipments.")
+                print(f"  [NOTE] {len(docs[kind])} {kind} documents; all of them are "
+                      f"read and merged into this shipment's one file. Give a shipment "
+                      f"its own subfolder under input\\ to keep it separate.")
+        if len(docs["reception"]) > 1:
+            print(f"  [WARN] {len(docs['reception'])} reception reports; only "
+                  f"{docs['reception'][0].name} is cross-checked.")
         print()
 
         try:
