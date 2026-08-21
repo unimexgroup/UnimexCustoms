@@ -13,3 +13,4 @@ database/*
 *.log
 .idea/
 .venv/
+issues/
