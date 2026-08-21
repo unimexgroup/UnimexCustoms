@@ -3,6 +3,61 @@
 All notable changes to UnimexCustoms. Versions are tagged `customs-vX.Y.Z`;
 the number must match `CUSTOMS_VERSION` in `_version.py` or CI refuses to build.
 
+## v1.5.1 — 2026-08-21
+
+Says so plainly when a document is a **photocopy rather than an export**. The
+customs team sent `220509656.pdf` as a file the exe "had issues with": 29 pages
+covering the whole of shipment `KBU07122026491` / invoice `IV00075089` — the
+reception report, the reconocimiento previo, four printings of the Runner
+(Xiamen) packing list, two commercial invoices, the waybills and the FCR. Every
+page is a 1-bit image from a RICOH MP 3055 copier and carries **zero
+characters**. It is the shipment straight after `KBU07052026468`, whose native
+workbook v1.5.0 was written to read.
+
+### Fixed
+
+- **A scan is now named as a scan.** The run said `[SKIP] shipment: no
+  commercial invoice found (found 1 unknown)`, which reads as a parsing gap the
+  tool should grow out of — the same wording it uses for a template nobody has
+  taught it yet. Nothing was wrong with the parsers: there was no text on the
+  page to parse. A PDF whose every page holds an image and not one character is
+  now identified as its own kind of document, and the run says what it is and
+  what to ask for instead — the file the sender's own system produced. The
+  `Troubleshooting` table has promised this diagnosis since v1.0.0; the tool now
+  actually gives it.
+- **A part-scanned bundle no longer loses pages in silence.** Where some pages
+  carry text and others are images, the readable ones parsed and the rest simply
+  were not there — no line said so, and a shipment can lose a whole invoice that
+  way. The run now names how many pages of a document could not be read.
+
+### Not done, deliberately: OCR
+
+Reading these pages means OCR, and OCR was measured against this file before
+being ruled out, not assumed to be unusable. On the *cleanest* page — the
+packing list, large type, no annotations over most of it — a current engine
+dropped the CARTONS cell on **10 of 22 rows**, every one of them a row a
+warehouse pencil-tick crosses. That is not a garbled character anyone would
+notice; it shifts the row left, so `306 | 34 | 265.586` is read as
+`306 | 265.586 | 2.612`. Weights here are allocated **by carton count**, so a
+silently missing carton figure corrupts the weight of every part sharing that
+pallet.
+
+The commercial invoice is worse, and it is the document the tool cannot do
+without. Across its 52 lines the engine returned `1013858883BU` as
+`101385888380`, `1413306-BL` as `1413306-8L`, `1547190-SN` as `1547190-5N`,
+`MRKU4670621` as `MRXU4670621`, the HS code `8481909000` as `84 81909000`, and
+the quantity `500.000` as `$00.000`. Those first two are the keys everything in
+this tool joins on — the purchase-order number and the part number — corrupted
+on roughly half the lines, and a part number that misses the database gets no
+HTS at all.
+
+So OCR here buys nothing. Either a misread digit reaches a customs filing as a
+real figure, or the reconciliation catches it and the run is a wall of `[CHECK]`
+lines with no usable output. The documents all exist as exports upstream — this
+supplier's previous shipment arrived as the workbook v1.5.0 reads — so the fix
+that produces a filing is asking for that file, and the fix in this version is
+saying so clearly enough that nobody spends an afternoon on the parsers instead.
+
 ## v1.5.0 — 2026-08-19
 
 Reads Runner (Xiamen)'s combined invoice + packing-list workbook, the first

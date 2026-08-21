@@ -262,14 +262,41 @@ def allocate_largest_remainder(total: float, weights: list[float]) -> list[float
 # PDF text extraction. Backends are NOT interchangeable (TRAP 5) -- try each
 # and keep whichever actually yields text.
 # ---------------------------------------------------------------------------
+class ScannedPdfError(RuntimeError):
+    """A PDF whose pages are images and hold no text: a photocopy, not an export.
+
+    Kept apart from every other read failure because the answer is different.
+    A parser that cannot read a text PDF is a bug in here. A page with no text
+    on it is not: there is nothing on it to parse, and no amount of work in
+    this file changes that. The only fix is the sender's original document.
+    """
+
+    def __init__(self, path: Path, pages: int):
+        self.path = path
+        self.pages = pages
+        super().__init__(f"{path.name} is a scan, not a text PDF: all {pages} "
+                         f"page(s) are images with no text layer")
+
+
 def extract_pdf_pages(path: Path) -> list[str]:
     """Return the text of every page, best available backend first."""
     attempts: list[str] = []
+    n_pages = image_only = 0
     try:
         import pdfplumber
         with pdfplumber.open(str(path)) as pdf:
             pages = [(p.extract_text() or "") for p in pdf.pages]
+            # Counted while the file is still open. A page carrying an image and
+            # not one character is a picture of a document, and saying so is the
+            # difference between a fault the team should report and a file only
+            # the sender can replace.
+            n_pages = len(pdf.pages)
+            image_only = sum(1 for pg in pdf.pages if pg.images and not pg.chars)
         if any(t.strip() for t in pages):
+            if image_only:
+                print(f"  [WARN] {path.name}: {image_only} of {n_pages} pages are "
+                      f"scanned images holding no text. Nothing they state is read "
+                      f"-- only the pages that carry text are.")
             return pages
         attempts.append("pdfplumber returned no text")
     except Exception as e:
@@ -286,6 +313,8 @@ def extract_pdf_pages(path: Path) -> list[str]:
     except Exception as e:
         attempts.append(f"pypdf failed ({type(e).__name__})")
 
+    if image_only and image_only == n_pages:
+        raise ScannedPdfError(path, n_pages)
     raise RuntimeError(f"could not read any text from {path.name}: {'; '.join(attempts)}")
 
 
@@ -2328,6 +2357,10 @@ def classify(path: Path) -> str:
     if suffix == ".pdf":
         try:
             pages = extract_pdf_pages(path)
+        except ScannedPdfError:
+            # Not an unrecognized document -- an unreadable one. The team is
+            # told which, because only one of the two is theirs to fix.
+            return "scan"
         except Exception:
             return "unknown"
         head = "\n".join(pages[:3])
@@ -2521,7 +2554,8 @@ def process_shipment(docs: dict[str, list[Path]], db: PartsDB,
     return len(res.problems), msg
 
 
-DOC_KINDS = ("invoices", "packing", "reception", "transport", "partsdb", "unknown")
+DOC_KINDS = ("invoices", "packing", "reception", "transport", "partsdb", "scan",
+             "unknown")
 
 
 def collect(folder: Path) -> dict[str, list[Path]]:
@@ -2545,6 +2579,30 @@ def collect(folder: Path) -> dict[str, list[Path]]:
         seen[digest] = p
         docs[classify(p)].append(p)
     return docs
+
+
+def report_scans(paths: list[Path]) -> None:
+    """Name the scanned documents and say what to ask for instead.
+
+    Worth spelling out rather than leaving as a one-word label, because the
+    natural reading of "could not read this PDF" is that the tool needs fixing.
+    It does not. Reading a picture of a page means OCR, and an OCR'd figure is a
+    guess: the two keys everything here joins on are a purchase-order number and
+    a part number, both long digit strings in small print, and the values are
+    prices to five decimals and ten-digit tariff codes. One misread character is
+    a wrong part, a wrong value or a wrong HTS on a customs filing, and nothing
+    downstream can tell it from a real one. Every one of these documents exists
+    as an export upstream -- that is the file to get.
+    """
+    for doc in paths:
+        print(f"  [SCANNED  ] {doc.name}  (a photocopy: an image of the page, no text)")
+    print("")
+    print("  This tool reads the text inside a PDF. A scan holds none of it, only")
+    print("  a picture of the page, so nothing in it can be read -- not the")
+    print("  invoice, not the packing list, not the reception report.")
+    print("  Ask the sender for the file their own system produced: the PDF export")
+    print("  or the Excel workbook, whichever they normally send. Same documents,")
+    print("  same shipment, exported instead of printed and photocopied.")
 
 
 def expand_zips(in_dir: Path) -> list[Path]:
@@ -2628,9 +2686,13 @@ def run(in_dir: Path, out_dir: Path, db_dir: Path) -> int:
             # Say what WAS recognized, so it is obvious whether the other
             # documents were understood and only the invoices are missing.
             seen = [f"{len(docs[k])} {k}" for k in ("packing", "reception", "transport",
-                                                    "unknown") if docs[k]]
+                                                    "scan", "unknown") if docs[k]]
             print(f"\n[SKIP] {label}: no commercial invoice found"
                   + (f" (found {', '.join(seen)})" if seen else ""))
+            # A scan is the likeliest reason there was no invoice to find, and
+            # it reads as a broken tool unless the run says otherwise.
+            if docs["scan"]:
+                report_scans(docs["scan"])
             problems += 1
             continue
 
@@ -2645,6 +2707,12 @@ def run(in_dir: Path, out_dir: Path, db_dir: Path) -> int:
         for p in docs["unknown"]:
             print(f"  [?????????] {p.name}  (not recognized -- check the file)")
             problems += 1
+        if docs["scan"]:
+            # Reached when the invoices arrived readable and something else in
+            # the folder is a photocopy: that document's figures are absent
+            # from the output, so it cannot pass quietly.
+            report_scans(docs["scan"])
+            problems += len(docs["scan"])
         # Say what is actually done with them. The old wording ("using X") named
         # one document while the run read and merged all of them, which is right
         # -- the customs file covers the whole shipment, several invoices and

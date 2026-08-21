@@ -182,6 +182,8 @@ whose first ten characters are `7419809991` — wrong, but still shaped like a v
 
 **There can be more than one Invoice Summary set.** This shipment has a 21-item summary mid-file and a 102-item summary at the end. Reading only the last one invents a discrepancy that does not exist. Every set is found and summed before anything is compared.
 
+**A PDF is not necessarily text.** A copier produces a PDF whose pages are photographs: images with not one character on them. `220509656.pdf` was 29 such pages covering an entire shipment. No parser reaches that content, and calling it "unrecognized" points the team at this file when the fix is upstream — so an all-image PDF is identified as a scan and reported as one, with what to ask for. Where only *some* pages are images the readable ones are still parsed, and the run says how many were not.
+
 **Transcribe verbatim.** Truncated fields, unclosed parentheses and short invoice HS codes are left exactly as printed. Nothing is tidied, repaired, expanded, or filled in from a different page.
 
 **Excel locks files.** If the output workbook is open, the save falls back to a timestamped filename and says so, rather than failing silently.
@@ -256,7 +258,9 @@ The updater never raises. Offline, DNS failure, GitHub 5xx, rate-limiting, a cha
 | `no parts database found` | `database\` is empty. Drop the latest `Kohler Parts for Upload ....xlsx` there. |
 | `refusing this packing list` | The PDF parsed, but the figures did not match the totals printed on it. The run continued without weights. Send the PDF to Andy — the template needs a look. |
 | PDF packing list read but weights look odd | Check the log for "could not be corroborated": that document states no totals, so nothing could be verified against it. |
-| `[SKIP] ...: no commercial invoice PDF found` | The invoice PDF is missing, or it is a scan with no text layer. |
+| `[SKIP] ...: no commercial invoice found` | The invoice is missing, or it is one of the `[SCANNED]` files listed under it. |
+| `[SCANNED  ] ...` | The PDF is a photocopy: an image of the page, holding no text. Nothing in it can be read. Ask the sender for the PDF export or the Excel workbook their system produces, not a printout of it. |
+| `[WARN] ...: N of M pages are scanned images` | A mixed document. The pages carrying text were read; whatever the image pages state is not in the output. |
 | Part on the `Review` sheet, blank HTS | Either the part is not in the database, or its base number carries conflicting codes. Resolve in the database, then re-run. |
 | `output gross != packing list` | The join dropped lines. Look for the `no packing-list row` / `no invoice line` `[CHECK]` lines above it. |
 | `reception report qty != invoice qty` | Genuine mismatch, or the report has rows the parser dropped. Check the row count printed for the report. |

@@ -6,4 +6,4 @@ Bump this constant, add a CHANGELOG entry, commit, then push a matching tag
 refuses to build if the tag's number disagrees with the constant here.
 """
 
-CUSTOMS_VERSION = "1.5.0"
+CUSTOMS_VERSION = "1.5.1"
